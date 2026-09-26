@@ -8,6 +8,7 @@ Self-contained script: Zero local subfolder dependencies.
 import os
 import sys
 import re
+import html
 import shutil
 import subprocess
 import tempfile
@@ -1392,21 +1393,57 @@ def find_cached_video(url_or_id: str, dest_dir: Path, index: int) -> Optional[Pa
     return None
 
 
-WEB_QUALITY_ORDER = ["2160p", "1080p", "720p", "480p", "360p"]
+def parse_resolution_height(label: str, url: str) -> int:
+    """Accurately extracts numeric height (e.g. 1080 for '1080p FHD' or '3194554_1080p.mp4') for sorting."""
+    label_str = (label or "").strip()
+    path = urllib.parse.urlparse(url).path
+
+    # 1. Check label for 4k / 2k
+    if re.search(r"\b4k\b", label_str, re.I):
+        return 2160
+    if re.search(r"\b2k\b", label_str, re.I):
+        return 1440
+
+    # 2. Check label for numeric resolution
+    num_match = re.search(r"(?:^|[\s_/-])(2160|1440|1080|720|480|360|240|144)p?(?:$|[\s_/-])", label_str, re.I)
+    if num_match:
+        return int(num_match.group(1))
+
+    num_any = re.search(r"(2160|1440|1080|720|480|360|240|144)", label_str)
+    if num_any:
+        return int(num_any.group(1))
+
+    # 3. Check URL path only (ignoring query parameters & security tokens)
+    if re.search(r"[-_.]4k[-_.]", path, re.I):
+        return 2160
+    path_match = re.search(r"[-_.](\d{3,4})p?[-_.]", path)
+    if path_match:
+        val = int(path_match.group(1))
+        if val in (2160, 1440, 1080, 720, 480, 360, 240, 144):
+            return val
+
+    return 0
+
+
+def format_quality_label(height: int, raw_label: str) -> str:
+    """Formats quality name nicely."""
+    if height == 2160:
+        return "2160p (4K UHD)"
+    if height == 1440:
+        return "1440p (2K QHD)"
+    if height == 1080:
+        return "1080p FHD"
+    if height == 720:
+        return "720p HD"
+    if height > 0:
+        return f"{height}p"
+    return raw_label if raw_label else "Default"
+
 
 WEB_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.4kporno.xxx/",
-    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
 }
 
 
@@ -1432,7 +1469,7 @@ def is_webpage_url(url_or_id: str) -> bool:
 
 def fetch_webpage_html(url: str, referer: Optional[str] = None) -> str:
     """
-    Fetches HTML content via Cloudflare WARP / Direct with curl fallback.
+    Fetches HTML content via requests with curl fallback.
     """
     domain = urllib.parse.urlparse(url).netloc
     ref = referer or f"https://{domain}/"
@@ -1458,11 +1495,6 @@ def fetch_webpage_html(url: str, referer: Optional[str] = None) -> str:
         "-H", f"Referer: {ref}",
         "-H", f"Accept: {req_headers['Accept']}",
         "-H", f"Accept-Language: {req_headers['Accept-Language']}",
-        "-H", f"Sec-Ch-Ua: {req_headers['Sec-Ch-Ua']}",
-        "-H", f"Sec-Ch-Ua-Platform: {req_headers['Sec-Ch-Ua-Platform']}",
-        "-H", f"Sec-Fetch-Dest: {req_headers['Sec-Fetch-Dest']}",
-        "-H", f"Sec-Fetch-Mode: {req_headers['Sec-Fetch-Mode']}",
-        "-H", f"Sec-Fetch-Site: {req_headers['Sec-Fetch-Site']}",
         "--compressed",
         url
     ]
@@ -1479,10 +1511,12 @@ def fetch_webpage_html(url: str, referer: Optional[str] = None) -> str:
 def extract_webpage_video_info(page_url: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Extracts the highest quality direct video URL, quality label, and title from a webpage.
+    Supports PornTrex (flashvars), TNAFlix (HTML5 size attributes), 4KPorno, and generic video pages.
     Returns: (video_stream_url, quality_label, title)
     """
     html_content = fetch_webpage_html(page_url)
 
+    # 1. Extract Title
     title = None
     if BeautifulSoup:
         soup = BeautifulSoup(html_content, "html.parser")
@@ -1491,50 +1525,91 @@ def extract_webpage_video_info(page_url: str) -> Tuple[Optional[str], Optional[s
             title = h1.get_text(strip=True)
         elif soup.title and soup.title.string:
             title = soup.title.string.strip()
+    else:
+        title_m = re.search(r"<h1[^>]*>(.*?)</h1>", html_content, re.DOTALL | re.IGNORECASE)
+        if title_m:
+            title = re.sub(r"<[^>]+>", "", title_m.group(1)).strip()
 
-        video = soup.find("video", id=lambda x: x and "html5_api" in x)
-        if not video:
-            video = soup.find("video")
+    if not title:
+        og_m = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\'](.*?)["\']', html_content, re.IGNORECASE)
+        if og_m:
+            title = og_m.group(1).strip()
 
-        sources: Dict[str, str] = {}
-        if video:
-            for source in video.find_all("source"):
+    streams = []
+
+    def add_candidate(raw_url: str, label_hint: str = ""):
+        if not raw_url:
+            return
+        clean_url = html.unescape(raw_url.strip())
+        full_url = urllib.parse.urljoin(page_url, clean_url)
+
+        # Skip non-video files (images/posters)
+        clean_path = full_url.lower().split("?")[0]
+        if any(ext in clean_path for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".vtt", ".srt"]):
+            return
+
+        res_h = parse_resolution_height(label_hint, full_url)
+        lbl = format_quality_label(res_h, label_hint)
+
+        if not any(s["url"] == full_url for s in streams):
+            streams.append({
+                "label": lbl,
+                "height": res_h,
+                "url": full_url
+            })
+
+    # Strategy A: Check flashvars JavaScript object (PornTrex / Kernel Video Sharing sites)
+    fv_block_match = re.search(r"flashvars\s*=\s*\{([^\}]+)\}", html_content, re.DOTALL)
+    if fv_block_match:
+        block = fv_block_match.group(1)
+        pairs = re.findall(r"([a-zA-Z0-9_]+)\s*:\s*['\"]([^'\"]*)['\"]", block)
+        flashvars_raw = dict(pairs)
+
+        url_keys = [k for k in flashvars_raw.keys() if k == "video_url" or k.startswith("video_alt_url")]
+        for k in url_keys:
+            if k.endswith("_text") or k.endswith("_hd"):
+                continue
+            v_url = flashvars_raw.get(k)
+            if v_url and v_url.startswith("http"):
+                lbl_key = f"{k}_text"
+                label = flashvars_raw.get(lbl_key, "")
+                add_candidate(v_url, label)
+
+    # Strategy B: Check HTML5 <video> and <source> elements (TNAFlix, 4KPorno, HTML5)
+    if BeautifulSoup:
+        soup = BeautifulSoup(html_content, "html.parser")
+        video_tag = soup.find("video", id=lambda x: x and "html5_api" in x) or soup.find("video")
+        if video_tag:
+            for source in video_tag.find_all("source"):
                 src = source.get("src")
-                label = source.get("label", "").strip().lower()
-                if src:
-                    if "2160" in label or "4k" in label:
-                        norm_label = "2160p"
-                    elif "1080" in label:
-                        norm_label = "1080p"
-                    elif "720" in label:
-                        norm_label = "720p"
-                    elif "480" in label:
-                        norm_label = "480p"
-                    elif "360" in label:
-                        norm_label = "360p"
-                    else:
-                        norm_label = label or "default"
-                    sources[norm_label] = urllib.parse.urljoin(page_url, src)
+                size_attr = source.get("size") or source.get("label") or source.get("data-res") or source.get("title") or ""
+                add_candidate(src, size_attr)
+            if video_tag.get("src"):
+                add_candidate(video_tag["src"], "Source Video")
 
-            if video.get("src"):
-                sources["current"] = urllib.parse.urljoin(page_url, video["src"])
+        for source in soup.find_all("source"):
+            src = source.get("src")
+            size_attr = source.get("size") or source.get("label") or source.get("data-res") or ""
+            add_candidate(src, size_attr)
 
-        for q in WEB_QUALITY_ORDER:
-            if q in sources:
-                return sources[q], q, title
+    # Strategy C: Regex fallback for <source> and get_file / .mp4 links
+    if not streams:
+        for s_match in re.finditer(r'<source\s+[^>]*src=["\']([^"\']+)["\'](?:\s+[^>]*size=["\']([^"\']*)["\'])?', html_content, re.IGNORECASE):
+            add_candidate(s_match.group(1), s_match.group(2) or "")
 
-        if sources:
-            first_q = next(iter(sources.keys()))
-            return sources[first_q], first_q, title
+        get_files = re.findall(r"https?://[^\s'\"<>\\]+/get_file/[^\s'\"<>\\]+", html_content)
+        for gf in get_files:
+            add_candidate(gf, "")
 
-    # Fallback regex search for video source URLs
-    mp4_matches = re.findall(r'(https?://[^"\'\s>]+\.(?:mp4|m4v|ts|webm)(?:/[^"\'\s>]*)?)', html_content, re.IGNORECASE)
-    if mp4_matches:
-        for q in WEB_QUALITY_ORDER:
-            for m in mp4_matches:
-                if q in m.lower():
-                    return m, q, title
-        return mp4_matches[0], "default", title
+        mp4_matches = re.findall(r'(https?://[^"\'\s>]+\.(?:mp4|m4v|ts|webm)(?:/[^"\'\s>]*)?)', html_content, re.IGNORECASE)
+        for m in mp4_matches:
+            add_candidate(m, "")
+
+    if streams:
+        # Sort strictly by resolution height descending (highest first)
+        streams.sort(key=lambda x: x["height"], reverse=True)
+        best = streams[0]
+        return best["url"], best["label"], title
 
     return None, None, title
 
