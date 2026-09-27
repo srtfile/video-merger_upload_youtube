@@ -41,10 +41,11 @@ def run_ffmpeg_with_progress(
     cmd: List[str],
     total_duration: float,
     progress_callback: Optional[Callable[[JoinProgress], None]] = None,
-    log_callback: Optional[Callable[[str], None]] = None
+    log_callback: Optional[Callable[[str], None]] = None,
+    deadline_time: Optional[float] = None
 ) -> Tuple[bool, str]:
     """
-    Execute ffmpeg subprocess, parsing progress pipe in real time.
+    Execute ffmpeg subprocess, parsing progress pipe in real time with optional deadline check.
     Returns (success: bool, error_output: str).
     """
     startupinfo = None
@@ -76,6 +77,7 @@ def run_ffmpeg_with_progress(
     out_time_sec = 0.0
     speed_str = "1.0x"
     fps_val = 0.0
+    timed_out = False
     
     # Non-blocking or threaded stderr collector
     import threading
@@ -91,6 +93,19 @@ def run_ffmpeg_with_progress(
     err_thread.start()
 
     for line in proc.stdout:
+        # Check if execution deadline has been reached
+        if deadline_time and time.time() >= deadline_time:
+            timed_out = True
+            try:
+                proc.terminate()
+                proc.wait(timeout=3.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            break
+
         line = line.strip()
         if not line:
             continue
@@ -137,6 +152,10 @@ def run_ffmpeg_with_progress(
                 prog.eta_sec = eta_sec
                 prog.status = "Complete" if stage == "end" else "Joining..."
                 progress_callback(prog)
+
+    if timed_out:
+        err_thread.join(timeout=1.0)
+        return False, "TIME_BUDGET_REACHED"
 
     proc.wait()
     err_thread.join(timeout=2.0)
@@ -418,12 +437,7 @@ class VideoJoiner:
         target_h = analysis.target_height or 1080
         target_fps = analysis.target_fps if analysis.target_fps > 0 else 30.0
         target_sr = analysis.target_audio_sample_rate or 48000
-        out_ext = output_path.suffix.lower()
-
-        vf = (
-            f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
-            f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps={target_fps}"
-        )
+        deadline_time = (job_start_time + (max_runtime_minutes * 60.0)) if (max_runtime_minutes and job_start_time) else None
 
         ts_segments: List[Path] = []
         resumed_count = 0
@@ -442,24 +456,28 @@ class VideoJoiner:
             ts_segments.append(seg_path)
 
             # Check safety time budget before starting next clip
-            if max_runtime_minutes and job_start_time:
-                elapsed_mins = (time.time() - job_start_time) / 60.0
-                if elapsed_mins >= max_runtime_minutes:
-                    pct = (i / n) * 100.0
-                    print(f"\n\n⚠️ ========================================================")
-                    print(f"⚠️ TIME LIMIT BUDGET REACHED ({elapsed_mins:.1f}m >= {max_runtime_minutes}m)!")
-                    print(f"💾 Checkpoint safely preserved in cache: {i}/{n} clips processed ({pct:.1f}%).")
-                    print(f"🔄 Setting resumed_needed=true for GitHub Actions auto-continuation.")
-                    print(f"========================================================\n")
-                    return False, f"TIME_BUDGET_REACHED ({i}/{n} clips done)", True
+            if deadline_time and time.time() >= deadline_time:
+                pct = (i / n) * 100.0
+                elapsed_mins = (time.time() - job_start_time) / 60.0 if job_start_time else 0.0
+                print(f"\n\n⚠️ ========================================================")
+                print(f"⚠️ TIME LIMIT BUDGET REACHED ({elapsed_mins:.1f}m >= {max_runtime_minutes}m)!")
+                print(f"💾 Checkpoint safely preserved in cache: {i}/{n} clips processed ({pct:.1f}%).")
+                print(f"🔄 Setting resumed_needed=true for GitHub Actions auto-continuation.")
+                print(f"========================================================\n")
+                return False, f"TIME_BUDGET_REACHED ({i}/{n} clips done)", True
 
             # Verify if this segment is already normalized and valid
             is_valid_segment = False
             if seg_path.is_file() and seg_path.stat().st_size > 1024:
                 seg_probe = probe_file(seg_path, self.ffprobe_exe, self.ffmpeg_exe)
                 if seg_probe and not seg_probe.error and seg_probe.video:
-                    if f.duration <= 0 or abs(seg_probe.duration - f.duration) < 2.0 or seg_probe.duration > 0.5:
-                        is_valid_segment = True
+                    if f.duration > 0:
+                        # Must match source clip duration within 2 seconds
+                        if abs(seg_probe.duration - f.duration) <= 2.0:
+                            is_valid_segment = True
+                    else:
+                        if seg_probe.duration > 1.0:
+                            is_valid_segment = True
 
             if is_valid_segment:
                 resumed_count += 1
@@ -516,7 +534,6 @@ class VideoJoiner:
                     str(seg_path)
                 ]
             else:
-                dur = f.duration if f.duration > 0 else 1.0
                 cmd = [
                     str(self.ffmpeg_exe), "-y",
                 ] + resilient_input_opts + [
@@ -537,8 +554,20 @@ class VideoJoiner:
                 sys.stdout.write(f"\r  [{'█'*int(30*(overall_p/100.0)):<30}] {overall_p:5.1f}% | Clip {i+1}/{n}: {clip_pct:5.1f}% | Speed: {p.speed}")
                 sys.stdout.flush()
 
-            success, err = run_ffmpeg_with_progress(cmd, f.duration, clip_progress)
+            success, err = run_ffmpeg_with_progress(cmd, f.duration, clip_progress, deadline_time=deadline_time)
             print()
+
+            if "TIME_BUDGET_REACHED" in err:
+                if seg_path.exists():
+                    seg_path.unlink(missing_ok=True)
+                pct = (i / n) * 100.0
+                elapsed_mins = (time.time() - job_start_time) / 60.0 if job_start_time else 0.0
+                print(f"\n\n⚠️ ========================================================")
+                print(f"⚠️ TIME LIMIT BUDGET REACHED DURING CLIP [{i+1}/{n}] '{f.path.name}' ({elapsed_mins:.1f}m >= {max_runtime_minutes}m)!")
+                print(f"💾 Checkpoint safely preserved in cache: {i}/{n} clips processed ({pct:.1f}%).")
+                print(f"🔄 Setting resumed_needed=true for GitHub Actions auto-continuation.")
+                print(f"========================================================\n")
+                return False, f"TIME_BUDGET_REACHED ({i}/{n} clips done)", True
 
             # Multi-stage fault-tolerant fallback if primary attempt failed (e.g. fatal audio bitstream corruption)
             if not success or not seg_path.is_file() or seg_path.stat().st_size < 1024:
@@ -569,8 +598,20 @@ class VideoJoiner:
                         "-bsf:v", "h264_mp4toannexb",
                         str(seg_path)
                     ]
-                    success, err = run_ffmpeg_with_progress(fallback_cmd, f.duration, clip_progress)
+                    success, err = run_ffmpeg_with_progress(fallback_cmd, f.duration, clip_progress, deadline_time=deadline_time)
                     print()
+                    if "TIME_BUDGET_REACHED" in err:
+                        if seg_path.exists():
+                            seg_path.unlink(missing_ok=True)
+                        pct = (i / n) * 100.0
+                        elapsed_mins = (time.time() - job_start_time) / 60.0 if job_start_time else 0.0
+                        print(f"\n\n⚠️ ========================================================")
+                        print(f"⚠️ TIME LIMIT BUDGET REACHED DURING CLIP [{i+1}/{n}] '{f.path.name}' ({elapsed_mins:.1f}m >= {max_runtime_minutes}m)!")
+                        print(f"💾 Checkpoint safely preserved in cache: {i}/{n} clips processed ({pct:.1f}%).")
+                        print(f"🔄 Setting resumed_needed=true for GitHub Actions auto-continuation.")
+                        print(f"========================================================\n")
+                        return False, f"TIME_BUDGET_REACHED ({i}/{n} clips done)", True
+
                     if success and seg_path.is_file() and seg_path.stat().st_size > 1024:
                         print(f"  ✅ Recovered clip [{i+1}/{n}] '{f.path.name}' successfully using video preservation fallback!")
 
