@@ -323,12 +323,12 @@ jobs:
           key: video-cache-${{ matrix.batch.name }}-${{ github.run_id }}
 
       - name: 🔄 Auto-Restart Continuation Run (if time budget reached)
-        if: steps.merge_step.outputs.resumed_needed == 'true'
+        if: always() && steps.merge_step.outputs.completed != 'true' && (steps.merge_step.outputs.resumed_needed == 'true' || cancelled())
         env:
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
         run: |
           echo "========================================================"
-          echo "🚀 Batch ${{ matrix.batch.index }} reached runtime safety limit (5.5 hours)."
+          echo "🚀 Batch ${{ matrix.batch.index }} reached runtime safety limit."
           echo "   Checkpoint has been saved to cache."
           echo "   Auto-triggering continuation run for Batch ${{ matrix.batch.index }}..."
           echo "========================================================"
