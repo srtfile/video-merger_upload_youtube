@@ -325,7 +325,7 @@ jobs:
       - name: 🔄 Auto-Restart Continuation Run (if time budget reached)
         if: steps.merge_step.outputs.resumed_needed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
         run: |
           echo "========================================================"
           echo "🚀 Batch ${{ matrix.batch.index }} reached runtime safety limit (5.5 hours)."
@@ -333,6 +333,7 @@ jobs:
           echo "   Auto-triggering continuation run for Batch ${{ matrix.batch.index }}..."
           echo "========================================================"
           gh workflow run "${{ github.workflow }}" \
+            --ref "${{ github.ref_name }}" \
             -f video_urls="${{ inputs.video_urls }}" \
             -f batch_range="${{ matrix.batch.index }}" \
             -f output_filename="${{ inputs.output_filename }}" \
