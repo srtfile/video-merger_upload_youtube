@@ -1318,11 +1318,13 @@ def download_video(
 def download_all_videos(
     urls: List[str],
     dest_dir: Path,
-    overall_callback: Optional[Callable[[int, int, str], None]] = None
-) -> List[Path]:
+    overall_callback: Optional[Callable[[int, int, str], None]] = None,
+    max_runtime_minutes: Optional[int] = None,
+    job_start_time: Optional[float] = None
+) -> Tuple[List[Path], bool]:
     """
-    Download a sequence of videos from a list of URLs (supporting file links and folder links).
-    Returns list of downloaded file paths.
+    Download a sequence of videos from a list of URLs (supporting file links and folder links) with safety time checkpointing.
+    Returns (list of downloaded file paths, resume_needed boolean).
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     downloaded_files: List[Path] = []
@@ -1330,6 +1332,18 @@ def download_all_videos(
     total_count = len(urls)
 
     for i, url in enumerate(urls, start=1):
+        if max_runtime_minutes and job_start_time:
+            elapsed_mins = (time.time() - job_start_time) / 60.0
+            if elapsed_mins >= max_runtime_minutes:
+                pct = ((i - 1) / total_count) * 100.0 if total_count else 0.0
+                print(f"\n\n⚠️ ========================================================")
+                print(f"⚠️ TIME LIMIT BUDGET REACHED DURING DOWNLOAD ({elapsed_mins:.1f}m >= {max_runtime_minutes}m)!")
+                print(f"💾 Checkpoint safely preserved in cache: {len(downloaded_files)}/{total_count} files downloaded ({pct:.1f}%).")
+                print(f"🔄 Setting resumed_needed=true for GitHub Actions auto-continuation.")
+                print(f"========================================================\n")
+                final_list = [convert_ts_to_mp4(p) if is_ts_file(p) else p for p in downloaded_files]
+                return final_list, True
+
         if is_gdrive_folder(url):
             if overall_callback:
                 overall_callback(i, total_count, f"Downloading Google Drive folder [{i}/{total_count}]...")
@@ -1374,4 +1388,4 @@ def download_all_videos(
         else:
             final_list.append(p)
 
-    return final_list
+    return final_list, False

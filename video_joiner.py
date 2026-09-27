@@ -1811,13 +1811,31 @@ def download_video(url_or_id: str, dest_dir: Path, index: int = 1) -> Path:
 
 
 
-def download_all_videos(urls: List[str], dest_dir: Path) -> List[Path]:
-    """Download all videos from URLs (files or folders) and convert any .ts to .mp4."""
+def download_all_videos(
+    urls: List[str],
+    dest_dir: Path,
+    max_runtime_minutes: Optional[int] = None,
+    job_start_time: Optional[float] = None
+) -> Tuple[List[Path], bool]:
+    """Download all videos from URLs (files or folders) and convert any .ts to .mp4, with time budget checkpointing."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     downloaded = []
     failed_downloads = []
     total = len(urls)
     for i, u in enumerate(urls, start=1):
+        # Check safety time budget before starting next download
+        if max_runtime_minutes and job_start_time:
+            elapsed_mins = (time.time() - job_start_time) / 60.0
+            if elapsed_mins >= max_runtime_minutes:
+                pct = ((i - 1) / total) * 100.0 if total else 0.0
+                print(f"\n\n⚠️ ========================================================")
+                print(f"⚠️ TIME LIMIT BUDGET REACHED DURING DOWNLOAD ({elapsed_mins:.1f}m >= {max_runtime_minutes}m)!")
+                print(f"💾 Checkpoint safely preserved in cache: {len(downloaded)}/{total} files downloaded ({pct:.1f}%).")
+                print(f"🔄 Setting resumed_needed=true for GitHub Actions auto-continuation.")
+                print(f"========================================================\n")
+                final_list = [convert_ts_to_mp4(p) if is_ts_file(p) else p for p in downloaded]
+                return final_list, True
+
         if is_gdrive_folder(u):
             try:
                 folder_vids = download_gdrive_folder(u, dest_dir)
@@ -1849,7 +1867,7 @@ def download_all_videos(urls: List[str], dest_dir: Path) -> List[Path]:
         else:
             final_list.append(p)
 
-    return final_list
+    return final_list, False
 
 
 # =====================================================================
@@ -2736,7 +2754,17 @@ def main():
 
             input_paths = []
             try:
-                input_paths = download_all_videos(g.urls, dest_dir=download_dir)
+                input_paths, dl_resume_needed = download_all_videos(
+                    g.urls,
+                    dest_dir=download_dir,
+                    max_runtime_minutes=args.max_runtime,
+                    job_start_time=job_start_time
+                )
+                if dl_resume_needed:
+                    set_github_action_output("completed", "false")
+                    set_github_action_output("resumed_needed", "true")
+                    print(f"\n💾 Download checkpoint preserved for Batch [{idx}/{len(batch_groups)}]: '{g.raw_label}'. Auto-continuation needed.")
+                    sys.exit(0)
             except Exception as dl_err:
                 print(f"❌ Batch [{idx}/{len(batch_groups)}] download failed: {dl_err}")
                 overall_success = False
@@ -2793,27 +2821,48 @@ def main():
     input_paths: List[Path] = []
     is_downloaded = False
     single_output_name = args.output
+    dl_resume_needed = False
 
     if batch_groups and len(batch_groups) == 1:
         single_g = batch_groups[0]
         if single_g.name != "merged_video" and (not args.output or args.output == "merged_video.mp4"):
             single_output_name = f"{single_g.name}.mp4"
-        input_paths = download_all_videos(single_g.urls, dest_dir=download_dir)
+        input_paths, dl_resume_needed = download_all_videos(
+            single_g.urls,
+            dest_dir=download_dir,
+            max_runtime_minutes=args.max_runtime,
+            job_start_time=job_start_time
+        )
         is_downloaded = True
     elif args.gdrive:
         urls = parse_links_file(Path(args.gdrive))
-        input_paths = download_all_videos(urls, dest_dir=download_dir)
+        input_paths, dl_resume_needed = download_all_videos(
+            urls,
+            dest_dir=download_dir,
+            max_runtime_minutes=args.max_runtime,
+            job_start_time=job_start_time
+        )
         is_downloaded = True
     elif args.urls:
         parsed_urls = []
         for item in args.urls:
             parsed_urls.extend(extract_urls_from_text(item))
-        input_paths = download_all_videos(parsed_urls, dest_dir=download_dir)
+        input_paths, dl_resume_needed = download_all_videos(
+            parsed_urls,
+            dest_dir=download_dir,
+            max_runtime_minutes=args.max_runtime,
+            job_start_time=job_start_time
+        )
         is_downloaded = True
     elif os.environ.get("GDRIVE_URLS") or os.environ.get("VIDEO_URLS"):
         env_val = os.environ.get("GDRIVE_URLS") or os.environ.get("VIDEO_URLS") or ""
         parsed_urls = extract_urls_from_text(env_val)
-        input_paths = download_all_videos(parsed_urls, dest_dir=download_dir)
+        input_paths, dl_resume_needed = download_all_videos(
+            parsed_urls,
+            dest_dir=download_dir,
+            max_runtime_minutes=args.max_runtime,
+            job_start_time=job_start_time
+        )
         is_downloaded = True
     elif args.input:
         for item in args.input:
@@ -2822,6 +2871,12 @@ def main():
                 input_paths.append(p)
     elif args.dir:
         input_paths = [p for p in Path(args.dir).iterdir() if p.is_file()]
+
+    if dl_resume_needed:
+        set_github_action_output("completed", "false")
+        set_github_action_output("resumed_needed", "true")
+        print(f"\n💾 Download checkpoint preserved for '{single_output_name}'. Auto-continuation needed.")
+        sys.exit(0)
 
     if not input_paths:
         print("❌ Error: No input video files or Google Drive URLs provided.")
