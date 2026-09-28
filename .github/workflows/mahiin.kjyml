@@ -61,10 +61,10 @@ on:
           - medium
           - slow
       max_runtime:
-        description: 'Safety max runtime in minutes before saving checkpoint and auto-continuing (default: 330 mins / 5.5 hours)'
+        description: 'Safety max runtime in minutes before saving checkpoint and auto-continuing (default: 350 mins / 5 hours 50 minutes)'
         required: false
         type: number
-        default: 330
+        default: 350
       upload_release:
         description: 'Create a GitHub Release with the merged video for direct public download?'
         required: false
@@ -276,7 +276,7 @@ jobs:
           JOIN_MODE: ${{ inputs.join_mode }}
           SORT_ORDER: ${{ inputs.sort_order }}
           PRESET: ${{ inputs.preset || 'veryfast' }}
-          MAX_RUNTIME: ${{ inputs.max_runtime || 330 }}
+          MAX_RUNTIME: ${{ inputs.max_runtime || 350 }}
           CI: 'true'
         run: |
           echo "========================================================"
@@ -332,7 +332,7 @@ jobs:
           echo "   Checkpoint has been saved to cache."
           echo "   Auto-triggering continuation run for Batch ${{ matrix.batch.index }}..."
           echo "========================================================"
-          gh workflow run "${{ github.workflow }}" \
+          gh workflow run main.yml \
             --ref "${{ github.ref_name }}" \
             -f video_urls="${{ inputs.video_urls }}" \
             -f batch_range="${{ matrix.batch.index }}" \
@@ -340,7 +340,7 @@ jobs:
             -f join_mode="${{ inputs.join_mode }}" \
             -f preset="${{ inputs.preset || 'veryfast' }}" \
             -f sort_order="${{ inputs.sort_order }}" \
-            -f max_runtime="${{ inputs.max_runtime || 330 }}" \
+            -f max_runtime="${{ inputs.max_runtime || 350 }}" \
             -f upload_release="${{ inputs.upload_release }}" \
             -f upload_youtube="${{ inputs.upload_youtube }}" \
             -f youtube_privacy="${{ inputs.youtube_privacy || 'private' }}" \
@@ -378,11 +378,24 @@ jobs:
             YT_TITLE="${{ matrix.batch.name }}"
           fi
           
-          python scripts/upload.py \
-            "${{ matrix.batch.output }}" \
-            --title "$YT_TITLE" \
-            --privacy "${{ inputs.youtube_privacy || 'private' }}" \
-            --timestamps-file "${{ steps.merge_step.outputs.timestamps_file || 'merged_video_times_stamp.txt' }}"
+          TARGET_VIDEOS=()
+          if [ -f "${{ matrix.batch.output }}" ]; then
+            TARGET_VIDEOS+=("${{ matrix.batch.output }}")
+          else
+            for f in *"Part"*.mp4; do
+              if [ -f "$f" ]; then
+                TARGET_VIDEOS+=("$f")
+              fi
+            done
+          fi
+          
+          if [ ${#TARGET_VIDEOS[@]} -gt 0 ]; then
+            python scripts/upload.py \
+              "${TARGET_VIDEOS[@]}" \
+              --title "$YT_TITLE" \
+              --privacy "${{ inputs.youtube_privacy || 'private' }}" \
+              --timestamps-file "${{ steps.merge_step.outputs.timestamps_file || 'merged_video_times_stamp.txt' }}"
+          fi
 
       - name: 🚀 Publish GitHub Release (Optional)
         if: ${{ inputs.upload_release == true && steps.merge_step.outputs.completed == 'true' }}
