@@ -262,10 +262,25 @@ def probe_file(file_path: Path, ffprobe_exe: Optional[Path], ffmpeg_exe: Optiona
                     a_info.bitrate = int(stream.get("bit_rate", 0))
                 except (ValueError, TypeError):
                     a_info.bitrate = 0
+                try:
+                    a_info.duration = float(stream.get("duration", 0.0))
+                except (ValueError, TypeError):
+                    a_info.duration = 0.0
                 info.audio = a_info
                 
             elif codec_type == "subtitle":
                 info.has_subtitles = True
+
+        # If format duration was missing or 0 (common in MPEG-TS files), use stream or ffmpeg probe
+        if info.duration <= 0.0:
+            if info.video and getattr(info.video, "duration", 0.0) > 0:
+                info.duration = info.video.duration
+            elif info.audio and getattr(info.audio, "duration", 0.0) > 0:
+                info.duration = info.audio.duration
+            elif ffmpeg_exe and ffmpeg_exe.is_file():
+                fb = probe_with_ffmpeg(file_path, ffmpeg_exe)
+                if fb and fb.duration > 0:
+                    info.duration = fb.duration
 
         if not info.video and not info.audio and ffmpeg_exe and ffmpeg_exe.is_file():
             fb = probe_with_ffmpeg(file_path, ffmpeg_exe)
