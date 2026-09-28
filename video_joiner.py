@@ -2027,13 +2027,9 @@ def _handle_signal_cancellation(signum, frame):
     global _current_segment_file
     print(f"\n\n⚠️ ========================================================")
     print(f"⚠️ Process received termination signal ({signum})!")
-    print(f"💾 Preserving completed checkpoint segments and signalling auto-continuation...")
+    print(f"💾 Checkpoint safely preserved in cache. Signalling auto-continuation...")
     print(f"========================================================\n")
-    if _current_segment_file and _current_segment_file.exists():
-        try:
-            _current_segment_file.unlink(missing_ok=True)
-        except Exception:
-            pass
+    # Preserve partial segment so next run can resume encoding from exact timestamp
     set_github_action_output("completed", "false")
     set_github_action_output("resumed_needed", "true")
     sys.exit(0)
@@ -2251,6 +2247,30 @@ class VideoJoiner:
             return self.join_lossless_remux(files, output_path, progress_callback)
         return success, err
 
+MAX_YOUTUBE_DURATION_SEC = 43000.0  # ~11h 56m (safely below YouTube's strict 12-hour / 43,200s limit)
+
+
+def partition_files_by_duration(files: List[MediaFileInfo], max_duration: float = MAX_YOUTUBE_DURATION_SEC) -> List[List[MediaFileInfo]]:
+    """Partition files into <= 12-hour parts for YouTube upload compliance."""
+    parts: List[List[MediaFileInfo]] = []
+    current_part: List[MediaFileInfo] = []
+    current_dur = 0.0
+
+    for f in files:
+        if current_part and (current_dur + f.duration > max_duration):
+            parts.append(current_part)
+            current_part = [f]
+            current_dur = f.duration
+        else:
+            current_part.append(f)
+            current_dur += f.duration
+
+    if current_part:
+        parts.append(current_part)
+
+    return parts
+
+
     def join_visually_lossless_transcode_resumable(
         self,
         files: List[MediaFileInfo],
@@ -2262,10 +2282,10 @@ class VideoJoiner:
         cache_dir: Optional[Path] = None,
         max_runtime_minutes: Optional[int] = None,
         job_start_time: Optional[float] = None
-    ) -> Tuple[bool, str, bool]:
+    ) -> Tuple[bool, str, bool, List[Path]]:
         """
-        Segment-by-segment resumable normalizer with checkpointing & safety time budget guard.
-        Returns: (success: bool, error_message: str, resume_needed: bool)
+        Segment-by-segment resumable normalizer with partial-clip resumption, checkpointing & 12h splitting.
+        Returns: (success: bool, error_message: str, resume_needed: bool, output_files: List[Path])
         """
         global _current_segment_file
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2289,7 +2309,7 @@ class VideoJoiner:
 
         print(f"\n🧩 Segment-by-Segment Resumable Normalization Engine")
         print(f"   Target Spec:   {target_w}x{target_h} @ {target_fps:.2f} fps, {target_sr} Hz Audio")
-        print(f"   Transcode:     libx264, preset={preset}, crf={crf}")
+        print(f"   Transcode:     libx264, preset={preset}, crf={crf}, threads=auto")
         print(f"   Cache Folder:  {cache_dir}")
         print(f"   Total Clips:   {n}")
         if max_runtime_minutes:
@@ -2319,25 +2339,22 @@ class VideoJoiner:
                 print(f"💾 Checkpoint safely preserved in cache: {i}/{n} clips processed ({pct:.1f}%).")
                 print(f"🔄 Setting resumed_needed=true for GitHub Actions auto-continuation.")
                 print(f"========================================================\n")
-                return False, f"TIME_BUDGET_REACHED ({i}/{n} clips done)", True
+                return False, f"TIME_BUDGET_REACHED ({i}/{n} clips done)", True, []
 
             # Verify if this segment is already normalized and valid
             is_valid_segment = False
+            partial_dur = 0.0
             if seg_path.is_file() and seg_path.stat().st_size > 1024:
-                # 1. First priority: Completed marker or manifest entry
                 if done_file.is_file() or (seg_key in manifest_data and manifest_data[seg_key].get("done")):
                     is_valid_segment = True
                 else:
-                    # 2. Deep probe validation for segments without marker
                     seg_probe = probe_file(seg_path, self.ffprobe_exe, self.ffmpeg_exe)
                     if seg_probe and not seg_probe.error and seg_probe.video:
                         if f.duration > 0:
-                            if seg_probe.duration > 0:
-                                if abs(seg_probe.duration - f.duration) <= max(10.0, f.duration * 0.15):
-                                    is_valid_segment = True
-                            else:
-                                if seg_path.stat().st_size > 10240:
-                                    is_valid_segment = True
+                            if seg_probe.duration > 0 and seg_probe.duration >= f.duration - 2.0:
+                                is_valid_segment = True
+                            elif seg_probe.duration > 0:
+                                partial_dur = seg_probe.duration
                         else:
                             if seg_probe.duration > 1.0 or seg_path.stat().st_size > 10240:
                                 is_valid_segment = True
@@ -2355,17 +2372,27 @@ class VideoJoiner:
                 sys.stdout.flush()
                 continue
 
-            if seg_path.exists():
-                seg_path.unlink(missing_ok=True)
-            if done_file.exists():
-                done_file.unlink(missing_ok=True)
+            # Check if we can do partial resumption for an interrupted clip
+            is_partial_resume = False
+            resume_offset = 0.0
+            seg_resume_part = cache_dir / f"seg_{i:04d}_resume.ts"
+            if seg_resume_part.exists():
+                seg_resume_part.unlink(missing_ok=True)
 
-            _current_segment_file = seg_path
-            cur_pct = (i / n) * 100.0
-            clip_dur_str = format_duration(f.duration) if f.duration > 0 else "unknown"
-            print(f"\n🎬 Normalizing Clip [{i+1}/{n}]: {f.path.name} ({clip_dur_str})...")
+            if partial_dur >= 5.0 and f.duration > 0 and partial_dur < f.duration - 2.0:
+                is_partial_resume = True
+                resume_offset = partial_dur
+                resume_pct = (resume_offset / f.duration) * 100.0
+                print(f"\n⚡ Resuming Clip [{i+1}/{n}]: '{f.path.name}' from {format_duration(resume_offset)} ({resume_pct:.1f}%) -> {format_duration(f.duration)}...")
+            else:
+                if seg_path.exists():
+                    seg_path.unlink(missing_ok=True)
+                if done_file.exists():
+                    done_file.unlink(missing_ok=True)
+                clip_dur_str = format_duration(f.duration) if f.duration > 0 else "unknown"
+                print(f"\n🎬 Normalizing Clip [{i+1}/{n}]: {f.path.name} ({clip_dur_str})...")
 
-            # Preserve 100% original resolution without re-scaling if clip already matches target dimensions
+            # Preserve original resolution without re-scaling if clip already matches target dimensions
             v_info = f.video
             if v_info and v_info.width == target_w and v_info.height == target_h and abs((v_info.fps or 0) - target_fps) < 0.05:
                 clip_vf = "setsar=1"
@@ -2377,8 +2404,6 @@ class VideoJoiner:
                     f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps={target_fps}"
                 )
 
-            # Resilient audio filtering: downmix/remap gracefully without crashing on corrupt packets
-            # that claim sudden channel jumps (e.g. 32 channels from corrupted AAC PCE headers).
             if f.audio and f.audio.channels == 1:
                 clip_af = "aresample=async=1:first_pts=0,pan=stereo|c0=c0|c1=c0"
             elif f.audio and f.audio.channels == 6:
@@ -2386,16 +2411,27 @@ class VideoJoiner:
             else:
                 clip_af = "aresample=async=1:first_pts=0,pan=stereo|c0=c0|c1=c1"
 
-            resilient_input_opts = [
-                "-fflags", "+genpts+discardcorrupt+igndts",
-                "-err_detect", "ignore_err"
-            ]
+            target_seg_dest = seg_resume_part if is_partial_resume else seg_path
+            _current_segment_file = target_seg_dest
+
+            if is_partial_resume:
+                resilient_input_opts = [
+                    "-ss", f"{resume_offset:.3f}",
+                    "-fflags", "+genpts+discardcorrupt+igndts",
+                    "-err_detect", "ignore_err"
+                ]
+            else:
+                resilient_input_opts = [
+                    "-fflags", "+genpts+discardcorrupt+igndts",
+                    "-err_detect", "ignore_err"
+                ]
 
             if f.audio:
                 cmd = [
                     str(self.ffmpeg_exe), "-y",
                 ] + resilient_input_opts + [
                     "-i", str(f.path),
+                    "-threads", "0",
                     "-vf", clip_vf,
                     "-af", clip_af,
                     "-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p",
@@ -2403,7 +2439,7 @@ class VideoJoiner:
                     "-avoid_negative_ts", "make_zero",
                     "-max_muxing_queue_size", "4096",
                     "-bsf:v", "h264_mp4toannexb",
-                    str(seg_path)
+                    str(target_seg_dest)
                 ]
             else:
                 cmd = [
@@ -2411,95 +2447,105 @@ class VideoJoiner:
                 ] + resilient_input_opts + [
                     "-i", str(f.path),
                     "-f", "lavfi", "-i", f"anullsrc=r={target_sr}:cl=stereo",
+                    "-threads", "0",
                     "-vf", clip_vf,
                     "-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p",
                     "-c:a", "aac", "-b:a", "192k", "-shortest",
                     "-avoid_negative_ts", "make_zero",
                     "-max_muxing_queue_size", "4096",
                     "-bsf:v", "h264_mp4toannexb",
-                    str(seg_path)
+                    str(target_seg_dest)
                 ]
 
+            rem_duration = max(1.0, f.duration - resume_offset) if is_partial_resume else f.duration
+
             def clip_progress(p: JoinProgress):
-                clip_pct = p.percent
+                clip_sec = min(f.duration, resume_offset + p.current_time_sec) if f.duration > 0 else (resume_offset + p.current_time_sec)
+                clip_pct = min(100.0, (clip_sec / f.duration) * 100.0) if f.duration > 0 else p.percent
                 overall_p = (i / n) * 100.0 + (clip_pct / n)
                 sys.stdout.write(f"\r  [{'█'*int(30*(overall_p/100.0)):<30}] {overall_p:5.1f}% | Clip {i+1}/{n}: {clip_pct:5.1f}% | Speed: {p.speed}")
                 sys.stdout.flush()
 
-            success, err = run_ffmpeg_with_progress(cmd, f.duration, clip_progress, deadline_time=deadline_time)
+            success, err = run_ffmpeg_with_progress(cmd, rem_duration, clip_progress, deadline_time=deadline_time)
             print()
 
             if "TIME_BUDGET_REACHED" in err:
-                if seg_path.exists():
-                    seg_path.unlink(missing_ok=True)
-                if done_file.exists():
-                    done_file.unlink(missing_ok=True)
+                # If partial resume piece was created, append to main seg_path to save progress
+                if is_partial_resume and seg_resume_part.is_file() and seg_resume_part.stat().st_size > 1024:
+                    try:
+                        with open(seg_path, "ab") as f_main, open(seg_resume_part, "rb") as f_sub:
+                            shutil.copyfileobj(f_sub, f_main)
+                        seg_resume_part.unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 _current_segment_file = None
                 pct = (i / n) * 100.0
                 elapsed_mins = (time.time() - job_start_time) / 60.0 if job_start_time else 0.0
                 print(f"\n\n⚠️ ========================================================")
                 print(f"⚠️ TIME LIMIT BUDGET REACHED DURING CLIP [{i+1}/{n}] '{f.path.name}' ({elapsed_mins:.1f}m >= {max_runtime_minutes}m)!")
-                print(f"💾 Checkpoint safely preserved in cache: {i}/{n} clips processed ({pct:.1f}%).")
+                print(f"💾 Checkpoint safely preserved in cache: partial progress saved. Auto-continuation needed.")
                 print(f"🔄 Setting resumed_needed=true for GitHub Actions auto-continuation.")
                 print(f"========================================================\n")
-                return False, f"TIME_BUDGET_REACHED ({i}/{n} clips done)", True
+                return False, f"TIME_BUDGET_REACHED ({i}/{n} clips done)", True, []
 
             # Multi-stage fault-tolerant fallback if primary attempt failed (e.g. fatal audio bitstream corruption)
-            if not success or not seg_path.is_file() or seg_path.stat().st_size < 1024:
-                if seg_path.exists():
-                    seg_path.unlink(missing_ok=True)
+            if not success or not target_seg_dest.is_file() or target_seg_dest.stat().st_size < 1024:
+                if not is_partial_resume:
+                    print(f"  ⚠️ Warning: Primary normalization failed for clip [{i+1}/{n}] '{f.path.name}'.")
+                    audio_err_keywords = ["aac", "swr", "rematrix", "filter", "audio", "sample rate", "channel", "aresample", "corrupt", "decode"]
+                    is_audio_suspect = any(k in err.lower() for k in audio_err_keywords) or (f.audio is not None)
 
-                print(f"  ⚠️ Warning: Primary normalization failed for clip [{i+1}/{n}] '{f.path.name}'.")
-                
-                # Check if failure is due to corrupt audio or filter network
-                audio_err_keywords = ["aac", "swr", "rematrix", "filter", "audio", "sample rate", "channel", "aresample", "corrupt", "decode"]
-                is_audio_suspect = any(k in err.lower() for k in audio_err_keywords) or (f.audio is not None)
+                    if is_audio_suspect:
+                        print(f"  🔄 Attempting Recovery: Normalizing video with clean synchronized audio replacement...")
+                        fallback_cmd = [
+                            str(self.ffmpeg_exe), "-y",
+                            "-fflags", "+genpts+discardcorrupt+igndts",
+                            "-err_detect", "ignore_err",
+                            "-i", str(f.path),
+                            "-f", "lavfi", "-i", f"anullsrc=r={target_sr}:cl=stereo",
+                            "-map", "0:v:0",
+                            "-map", "1:a:0",
+                            "-threads", "0",
+                            "-vf", clip_vf,
+                            "-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p",
+                            "-c:a", "aac", "-b:a", "192k", "-shortest",
+                            "-avoid_negative_ts", "make_zero",
+                            "-max_muxing_queue_size", "4096",
+                            "-bsf:v", "h264_mp4toannexb",
+                            str(seg_path)
+                        ]
+                        success, err = run_ffmpeg_with_progress(fallback_cmd, f.duration, clip_progress, deadline_time=deadline_time)
+                        print()
+                        if "TIME_BUDGET_REACHED" in err:
+                            _current_segment_file = None
+                            pct = (i / n) * 100.0
+                            elapsed_mins = (time.time() - job_start_time) / 60.0 if job_start_time else 0.0
+                            print(f"\n\n⚠️ ========================================================")
+                            print(f"⚠️ TIME LIMIT BUDGET REACHED DURING CLIP [{i+1}/{n}] '{f.path.name}' ({elapsed_mins:.1f}m >= {max_runtime_minutes}m)!")
+                            print(f"💾 Checkpoint safely preserved in cache: partial progress saved. Auto-continuation needed.")
+                            print(f"🔄 Setting resumed_needed=true for GitHub Actions auto-continuation.")
+                            print(f"========================================================\n")
+                            return False, f"TIME_BUDGET_REACHED ({i}/{n} clips done)", True, []
 
-                if is_audio_suspect:
-                    print(f"  🔄 Attempting Recovery: Normalizing video with clean synchronized audio replacement...")
-                    fallback_cmd = [
-                        str(self.ffmpeg_exe), "-y",
-                        "-fflags", "+genpts+discardcorrupt+igndts",
-                        "-err_detect", "ignore_err",
-                        "-i", str(f.path),
-                        "-f", "lavfi", "-i", f"anullsrc=r={target_sr}:cl=stereo",
-                        "-map", "0:v:0",
-                        "-map", "1:a:0",
-                        "-vf", clip_vf,
-                        "-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p",
-                        "-c:a", "aac", "-b:a", "192k", "-shortest",
-                        "-avoid_negative_ts", "make_zero",
-                        "-max_muxing_queue_size", "4096",
-                        "-bsf:v", "h264_mp4toannexb",
-                        str(seg_path)
-                    ]
-                    success, err = run_ffmpeg_with_progress(fallback_cmd, f.duration, clip_progress, deadline_time=deadline_time)
-                    print()
-                    if "TIME_BUDGET_REACHED" in err:
-                        if seg_path.exists():
-                            seg_path.unlink(missing_ok=True)
-                        if done_file.exists():
-                            done_file.unlink(missing_ok=True)
-                        _current_segment_file = None
-                        pct = (i / n) * 100.0
-                        elapsed_mins = (time.time() - job_start_time) / 60.0 if job_start_time else 0.0
-                        print(f"\n\n⚠️ ========================================================")
-                        print(f"⚠️ TIME LIMIT BUDGET REACHED DURING CLIP [{i+1}/{n}] '{f.path.name}' ({elapsed_mins:.1f}m >= {max_runtime_minutes}m)!")
-                        print(f"💾 Checkpoint safely preserved in cache: {i}/{n} clips processed ({pct:.1f}%).")
-                        print(f"🔄 Setting resumed_needed=true for GitHub Actions auto-continuation.")
-                        print(f"========================================================\n")
-                        return False, f"TIME_BUDGET_REACHED ({i}/{n} clips done)", True
+                        if success and seg_path.is_file() and seg_path.stat().st_size > 1024:
+                            print(f"  ✅ Recovered clip [{i+1}/{n}] '{f.path.name}' successfully using video preservation fallback!")
 
-                    if success and seg_path.is_file() and seg_path.stat().st_size > 1024:
-                        print(f"  ✅ Recovered clip [{i+1}/{n}] '{f.path.name}' successfully using video preservation fallback!")
+            # If this was a partial resume, merge resume part into main seg_path
+            if is_partial_resume and success and seg_resume_part.is_file() and seg_resume_part.stat().st_size > 1024:
+                try:
+                    with open(seg_path, "ab") as f_main, open(seg_resume_part, "rb") as f_sub:
+                        shutil.copyfileobj(f_sub, f_main)
+                    seg_resume_part.unlink(missing_ok=True)
+                except Exception as merge_err:
+                    print(f"  ⚠️ Warning appending resume segment: {merge_err}")
 
             _current_segment_file = None
-            if not success or not seg_path.is_file() or seg_path.stat().st_size < 1024:
+            if not seg_path.is_file() or seg_path.stat().st_size < 1024:
                 if seg_path.exists():
                     seg_path.unlink(missing_ok=True)
                 if done_file.exists():
                     done_file.unlink(missing_ok=True)
-                return False, f"Error normalizing clip [{i+1}/{n}] {f.path.name}: {err}", False
+                return False, f"Error normalizing clip [{i+1}/{n}] {f.path.name}: {err}", False, []
 
             # Mark segment as successfully completed
             try:
@@ -2518,43 +2564,66 @@ class VideoJoiner:
 
         _current_segment_file = None
 
-        # All segments normalized! Losslessly concatenate them
-        concat_list_file = cache_dir / "concat_segments.txt"
-        with open(concat_list_file, "w", encoding="utf-8") as lf:
-            for s in ts_segments:
-                escaped = s.resolve().as_posix().replace("'", "'\\''")
-                lf.write(f"file '{escaped}'\n")
-
         print(f"\n⚡ All {n} segments normalized! (Resumed {resumed_count}, Transcoded {n - resumed_count})")
-        print(f"🚀 Losslessly concatenating segments into '{output_path.name}'...")
 
-        concat_cmd = [
-            str(self.ffmpeg_exe), "-y",
-            "-fflags", "+genpts+discardcorrupt",
-            "-f", "concat", "-safe", "0",
-            "-i", str(concat_list_file),
-            "-c", "copy",
-            "-avoid_negative_ts", "make_zero"
-        ]
-        if out_ext in (".mp4", ".m4v", ".mov"):
-            concat_cmd.extend(["-bsf:a", "aac_adtstoasc", "-movflags", "+faststart"])
-        concat_cmd.append(str(output_path))
+        # Partition if total duration exceeds 12 hours (YouTube limit)
+        parts = partition_files_by_duration(files, MAX_YOUTUBE_DURATION_SEC)
+        generated_part_files: List[Path] = []
 
-        success, err = run_ffmpeg_with_progress(concat_cmd, total_duration, progress_callback)
-        try:
-            if concat_list_file.exists():
-                concat_list_file.unlink()
-        except Exception:
-            pass
+        if len(parts) > 1:
+            print(f"\n📦 Output total duration ({format_duration(total_duration)}) exceeds YouTube's 12-hour limit (43,200s).")
+            print(f"   Auto-partitioning into {len(parts)} parts (<= 12 hours each) for YouTube compliance:")
+            for p_idx, p_files in enumerate(parts, 1):
+                p_dur = sum(x.duration for x in p_files)
+                print(f"   • Part {p_idx}: {len(p_files)} clips ({format_duration(p_dur)})")
 
-        if not success or not output_path.is_file():
-            return False, f"Failed lossless concat of segments: {err}", False
+        for p_idx, p_files in enumerate(parts, 1):
+            if len(parts) == 1:
+                target_part_output = output_path
+            else:
+                target_part_output = output_path.parent / f"{output_path.stem}_Part{p_idx}{output_path.suffix}"
 
-        return True, "", False
+            generated_part_files.append(target_part_output)
+            part_duration = sum(x.duration for x in p_files)
+            part_label = f"Part {p_idx}/{len(parts)}" if len(parts) > 1 else "output"
+            print(f"\n🚀 Losslessly concatenating {part_label} segments into '{target_part_output.name}'...")
+
+            part_concat_file = cache_dir / f"concat_part_{p_idx}.txt"
+            with open(part_concat_file, "w", encoding="utf-8") as lf:
+                for s_f in p_files:
+                    s_idx = files.index(s_f)
+                    s_path = cache_dir / f"seg_{s_idx:04d}.ts"
+                    escaped = s_path.resolve().as_posix().replace("'", "'\\''")
+                    lf.write(f"file '{escaped}'\n")
+
+            concat_cmd = [
+                str(self.ffmpeg_exe), "-y",
+                "-fflags", "+genpts+discardcorrupt",
+                "-f", "concat", "-safe", "0",
+                "-i", str(part_concat_file),
+                "-c", "copy",
+                "-avoid_negative_ts", "make_zero"
+            ]
+            if out_ext in (".mp4", ".m4v", ".mov"):
+                concat_cmd.extend(["-bsf:a", "aac_adtstoasc", "-movflags", "+faststart"])
+            concat_cmd.append(str(target_part_output))
+
+            success, err = run_ffmpeg_with_progress(concat_cmd, part_duration, progress_callback)
+            print()
+            try:
+                if part_concat_file.exists():
+                    part_concat_file.unlink()
+            except Exception:
+                pass
+
+            if not success or not target_part_output.is_file():
+                return False, f"Failed lossless concat of {part_label}: {err}", False, []
+
+        return True, "", False, generated_part_files
 
     def join_visually_lossless_transcode(self, files: List[MediaFileInfo], analysis: CompatibilityAnalysis, output_path: Path, crf: int = 17, preset: str = "veryfast", progress_callback=None, cache_dir: Optional[Path] = None, max_runtime_minutes: Optional[int] = None, job_start_time: Optional[float] = None) -> Tuple[bool, str]:
         """Harmonize mismatched resolutions/codecs using resumable segment normalizer."""
-        success, err, _ = self.join_visually_lossless_transcode_resumable(
+        success, err, _, _ = self.join_visually_lossless_transcode_resumable(
             files, analysis, output_path, crf=crf, preset=preset,
             progress_callback=progress_callback, cache_dir=cache_dir,
             max_runtime_minutes=max_runtime_minutes, job_start_time=job_start_time
@@ -2594,10 +2663,9 @@ def write_github_step_summary(files: List[MediaFileInfo], analysis: Compatibilit
     try:
         with open(summary_path, "a", encoding="utf-8") as f:
             f.write("# 🎬 Video Joiner Execution Summary\n\n")
-            if success and output_path.is_file():
+            if success and (output_path.is_file() or any(output_path.parent.glob(f"{output_path.stem}_Part*.mp4"))):
                 f.write("### 🎉 Success: Video Merged Successfully!\n\n")
-                f.write(f"- **Output File:** `{output_path.name}`\n")
-                f.write(f"- **File Size:** `{format_size(output_path.stat().st_size)}`\n")
+                f.write(f"- **Output Target:** `{output_path.name}`\n")
                 f.write(f"- **Total Duration:** `{format_duration(analysis.total_duration)}`\n")
                 f.write(f"- **Processing Mode:** `{mode_used}`\n\n")
                 if "Lossless" in mode_used:
@@ -2717,7 +2785,7 @@ def upload_merged_video_to_youtube(
     """
     Invokes scripts/upload.py to upload the merged video with timestamps chapters to YouTube.
     """
-    print(f"\n📺 Auto-uploading merged video to YouTube ({privacy.upper()})...")
+    print(f"\n📺 Auto-uploading merged video to YouTube ({privacy.upper()}): {video_path.name}...")
     upload_script = Path(__file__).parent / "scripts" / "upload.py"
     if not upload_script.is_file():
         upload_script = Path("scripts/upload.py")
@@ -2743,7 +2811,7 @@ def upload_merged_video_to_youtube(
     try:
         res = subprocess.run(cmd, check=False)
         if res.returncode == 0:
-            print("✅ YouTube upload completed successfully!")
+            print(f"✅ YouTube upload completed successfully for {video_path.name}!")
             return "success"
         else:
             print(f"⚠️ YouTube upload process returned non-zero exit code: {res.returncode}")
@@ -2828,19 +2896,38 @@ def execute_join(
     success = False
     err_msg = ""
     resume_needed = False
+    generated_outputs: List[Path] = []
+
+    parts = partition_files_by_duration(probed_files, MAX_YOUTUBE_DURATION_SEC)
 
     if use_lossless:
-        success, err_msg = joiner.join_lossless_smart(probed_files, output_path, progress_callback)
+        if len(parts) == 1:
+            success, err_msg = joiner.join_lossless_smart(probed_files, output_path, progress_callback)
+            if success:
+                generated_outputs = [output_path]
+        else:
+            print(f"📦 Total duration exceeds YouTube's 12-hour limit. Joining into {len(parts)} lossless parts...")
+            success = True
+            for p_idx, p_files in enumerate(parts, 1):
+                part_out = output_path.parent / f"{output_path.stem}_Part{p_idx}{output_path.suffix}"
+                part_success, p_err = joiner.join_lossless_smart(p_files, part_out, progress_callback)
+                if part_success and part_out.is_file():
+                    generated_outputs.append(part_out)
+                else:
+                    success = False
+                    err_msg = p_err
+                    break
+
         if not success and mode == "auto":
             print("\n🔄 Falling back to Resumable Visually Lossless Transcode...")
             mode_reported = f"Fallback Resumable Transcode (CRF {crf}, preset {preset})"
-            success, err_msg, resume_needed = joiner.join_visually_lossless_transcode_resumable(
+            success, err_msg, resume_needed, generated_outputs = joiner.join_visually_lossless_transcode_resumable(
                 probed_files, analysis, output_path, crf=crf, preset=preset,
                 progress_callback=progress_callback, cache_dir=cache_dir,
                 max_runtime_minutes=max_runtime_minutes, job_start_time=job_start_time
             )
     else:
-        success, err_msg, resume_needed = joiner.join_visually_lossless_transcode_resumable(
+        success, err_msg, resume_needed, generated_outputs = joiner.join_visually_lossless_transcode_resumable(
             probed_files, analysis, output_path, crf=crf, preset=preset,
             progress_callback=progress_callback, cache_dir=cache_dir,
             max_runtime_minutes=max_runtime_minutes, job_start_time=job_start_time
@@ -2849,26 +2936,34 @@ def execute_join(
     print()
     write_github_step_summary(probed_files, analysis, output_path, mode_reported, success, err_msg)
 
-    if success and output_path.is_file():
-        print(f"\n🎉 SUCCESS! Merged video saved: {output_path} ({format_size(output_path.stat().st_size)})")
+    if success and generated_outputs:
+        print(f"\n🎉 SUCCESS! All {len(generated_outputs)} video part(s) created successfully!")
         
-        # 1. Automatically generate timestamps/chapters file
-        ts_file = generate_timestamps_file(probed_files, output_path)
+        # 1. Automatically generate timestamps/chapters file for each part
+        ts_files = []
+        for p_idx, (p_file, p_files) in enumerate(zip(generated_outputs, parts), 1):
+            ts_f = generate_timestamps_file(p_files, p_file)
+            ts_files.append(ts_f)
+
         set_github_action_output("completed", "true")
         set_github_action_output("resumed_needed", "false")
-        set_github_action_output("timestamps_file", str(ts_file.resolve()))
+        if ts_files:
+            set_github_action_output("timestamps_file", str(ts_files[0].resolve()))
 
-        # 2. Auto upload to YouTube if enabled
+        # 2. Auto upload each part to YouTube if enabled
         if upload_youtube:
             upload_title = youtube_title or output_path.stem
-            upload_merged_video_to_youtube(
-                video_path=output_path,
-                timestamps_file=ts_file,
-                title=upload_title,
-                privacy=youtube_privacy,
-                category=youtube_category,
-                tags=youtube_tags,
-            )
+            for p_idx, (p_file, ts_f) in enumerate(zip(generated_outputs, ts_files), 1):
+                part_title_suffix = f" (Part {p_idx}/{len(generated_outputs)})" if len(generated_outputs) > 1 else ""
+                part_yt_title = f"{upload_title}{part_title_suffix}"
+                upload_merged_video_to_youtube(
+                    video_path=p_file,
+                    timestamps_file=ts_f,
+                    title=part_yt_title,
+                    privacy=youtube_privacy,
+                    category=youtube_category,
+                    tags=youtube_tags,
+                )
 
         return True, False
 
@@ -2904,7 +2999,7 @@ def main():
     parser.add_argument("--crf", type=int, default=17, help="Transcode CRF.")
     parser.add_argument("--preset", default="veryfast", choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"], help="x264 transcode speed preset (default: veryfast).")
     parser.add_argument("--cache-dir", default=None, help="Segment cache directory for resumable processing.")
-    parser.add_argument("--max-runtime", type=int, default=330, help="Maximum execution runtime in minutes before saving checkpoint (default: 330).")
+    parser.add_argument("--max-runtime", type=int, default=350, help="Maximum execution runtime in minutes before saving checkpoint (default: 350 / 5 hours 50 minutes).")
     parser.add_argument("--sort", choices=["natural", "alphabetical", "date", "size", "none"], default="natural", help="Sort order.")
     parser.add_argument("--reverse", action="store_true", help="Reverse sort.")
     parser.add_argument("-y", "--yes", action="store_true", help="Overwrite without asking.")
