@@ -451,9 +451,20 @@ class VideoJoiner:
         if max_runtime_minutes:
             print(f"   Safety Budget: {max_runtime_minutes} minutes max runtime")
 
+        manifest_path = cache_dir / "normalization_manifest.json"
+        manifest_data = {}
+        if manifest_path.is_file():
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as mf:
+                    manifest_data = json.load(mf)
+            except Exception:
+                manifest_data = {}
+
         for i, f in enumerate(files):
             seg_path = cache_dir / f"seg_{i:04d}.ts"
+            done_file = cache_dir / f"seg_{i:04d}.done"
             ts_segments.append(seg_path)
+            seg_key = f"seg_{i:04d}"
 
             # Check safety time budget before starting next clip
             if deadline_time and time.time() >= deadline_time:
@@ -469,15 +480,29 @@ class VideoJoiner:
             # Verify if this segment is already normalized and valid
             is_valid_segment = False
             if seg_path.is_file() and seg_path.stat().st_size > 1024:
-                seg_probe = probe_file(seg_path, self.ffprobe_exe, self.ffmpeg_exe)
-                if seg_probe and not seg_probe.error and seg_probe.video:
-                    if f.duration > 0:
-                        # Must match source clip duration within 2 seconds
-                        if abs(seg_probe.duration - f.duration) <= 2.0:
-                            is_valid_segment = True
-                    else:
-                        if seg_probe.duration > 1.0:
-                            is_valid_segment = True
+                # 1. First priority: Completed marker or manifest entry
+                if done_file.is_file() or (seg_key in manifest_data and manifest_data[seg_key].get("done")):
+                    is_valid_segment = True
+                else:
+                    # 2. Deep probe validation for segments without marker
+                    seg_probe = probe_file(seg_path, self.ffprobe_exe, self.ffmpeg_exe)
+                    if seg_probe and not seg_probe.error and seg_probe.video:
+                        if f.duration > 0:
+                            if seg_probe.duration > 0:
+                                if abs(seg_probe.duration - f.duration) <= max(10.0, f.duration * 0.15):
+                                    is_valid_segment = True
+                            else:
+                                if seg_path.stat().st_size > 10240:
+                                    is_valid_segment = True
+                        else:
+                            if seg_probe.duration > 1.0 or seg_path.stat().st_size > 10240:
+                                is_valid_segment = True
+
+                if is_valid_segment and not done_file.is_file():
+                    try:
+                        done_file.touch(exist_ok=True)
+                    except Exception:
+                        pass
 
             if is_valid_segment:
                 resumed_count += 1
@@ -488,6 +513,8 @@ class VideoJoiner:
 
             if seg_path.exists():
                 seg_path.unlink(missing_ok=True)
+            if done_file.exists():
+                done_file.unlink(missing_ok=True)
 
             cur_pct = (i / n) * 100.0
             clip_dur_str = f"{f.duration:.1f}s" if f.duration > 0 else "unknown"
@@ -560,6 +587,8 @@ class VideoJoiner:
             if "TIME_BUDGET_REACHED" in err:
                 if seg_path.exists():
                     seg_path.unlink(missing_ok=True)
+                if done_file.exists():
+                    done_file.unlink(missing_ok=True)
                 pct = (i / n) * 100.0
                 elapsed_mins = (time.time() - job_start_time) / 60.0 if job_start_time else 0.0
                 print(f"\n\n⚠️ ========================================================")
@@ -603,6 +632,8 @@ class VideoJoiner:
                     if "TIME_BUDGET_REACHED" in err:
                         if seg_path.exists():
                             seg_path.unlink(missing_ok=True)
+                        if done_file.exists():
+                            done_file.unlink(missing_ok=True)
                         pct = (i / n) * 100.0
                         elapsed_mins = (time.time() - job_start_time) / 60.0 if job_start_time else 0.0
                         print(f"\n\n⚠️ ========================================================")
@@ -615,10 +646,27 @@ class VideoJoiner:
                     if success and seg_path.is_file() and seg_path.stat().st_size > 1024:
                         print(f"  ✅ Recovered clip [{i+1}/{n}] '{f.path.name}' successfully using video preservation fallback!")
 
-            if not success or not seg_path.is_file():
+            if not success or not seg_path.is_file() or seg_path.stat().st_size < 1024:
                 if seg_path.exists():
                     seg_path.unlink(missing_ok=True)
+                if done_file.exists():
+                    done_file.unlink(missing_ok=True)
                 return False, f"Error normalizing clip [{i+1}/{n}] {f.path.name}: {err}", False
+
+            # Mark segment as successfully completed
+            try:
+                done_file.touch(exist_ok=True)
+                manifest_data[seg_key] = {
+                    "index": i,
+                    "name": f.path.name,
+                    "size": seg_path.stat().st_size,
+                    "done": True,
+                    "timestamp": time.time()
+                }
+                with open(manifest_path, "w", encoding="utf-8") as mf:
+                    json.dump(manifest_data, mf, indent=2)
+            except Exception:
+                pass
 
         # All segments normalized! Losslessly concatenate them
         concat_list_file = cache_dir / "concat_segments.txt"
