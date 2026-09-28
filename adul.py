@@ -162,19 +162,27 @@ def download_video(video_url: str, output_path: str, referer: str = None) -> boo
     print(f"Downloading to: {output_path}")
     temp_path = output_path + ".part"
 
-    # 1. Try ultra-fast aria2c (16 parallel connections)
+    # 1. Try aria2c (8 parallel connections for CDN tolerance)
     aria2_bin = "aria2c.exe" if sys.platform == "win32" else "aria2c"
     aria2_path = shutil.which(aria2_bin) or shutil.which("aria2c")
+    aria2_lock = temp_path + ".aria2"
+    if os.path.exists(aria2_lock):
+        try:
+            os.remove(aria2_lock)
+        except Exception:
+            pass
+
     if aria2_path:
         try:
-            print(f"⚡ [Multi-Threaded Download] Using aria2c (16 parallel streams)...")
+            print(f"⚡ [Multi-Threaded Download] Using aria2c (8 parallel streams)...")
             aria2_cmd = [
                 str(aria2_path),
-                "-x", "16",
-                "-s", "16",
-                "-j", "16",
+                "-x", "8",
+                "-s", "8",
+                "-j", "8",
                 "-k", "1M",
                 "--file-allocation=none",
+                "--check-certificate=false",
                 "--header", f"Referer: {download_headers.get('Referer', '')}",
                 "--header", f"User-Agent: {download_headers.get('User-Agent', '')}",
                 "--dir", os.path.dirname(os.path.abspath(output_path)),
@@ -187,37 +195,61 @@ def download_video(video_url: str, output_path: str, referer: str = None) -> boo
                 video_url
             ]
             res = subprocess.run(aria2_cmd)
-            if res.returncode == 0 and os.path.isfile(temp_path) and os.path.getsize(temp_path) > 1024:
+            if res.returncode == 0 and os.path.isfile(temp_path) and os.path.getsize(temp_path) > 10240:
                 if os.path.exists(output_path):
                     os.remove(output_path)
                 os.rename(temp_path, output_path)
                 print(f"✅ [aria2c] Done: {output_path}")
                 return True
+            else:
+                if os.path.exists(aria2_lock):
+                    try:
+                        os.remove(aria2_lock)
+                    except Exception:
+                        pass
         except Exception as e:
             print(f"⚠️ aria2c note: {e}")
+            if os.path.exists(aria2_lock):
+                try:
+                    os.remove(aria2_lock)
+                except Exception:
+                    pass
 
-    try:
-        resp = request_with_retry(
-            video_url, method="GET", headers=download_headers, stream=True, timeout=60
-        )
-        total_size = int(resp.headers.get("content-length", 0))
-        chunk_size = 4 * 1024 * 1024
+    # 2. Resilient requests streaming with Range resumption
+    download_ok = False
+    for attempt in range(1, 6):
+        try:
+            curr_size = os.path.getsize(temp_path) if os.path.isfile(temp_path) else 0
+            req_headers = download_headers.copy()
+            if curr_size > 0:
+                req_headers["Range"] = f"bytes={curr_size}-"
 
-        if tqdm:
-            with open(temp_path, "wb") as f, tqdm(
-                total=total_size,
-                unit="B",
-                unit_scale=True,
-                unit_divisor=1024,
-                desc=os.path.basename(output_path)[:30],
-            ) as bar:
-                for chunk in resp.iter_content(chunk_size=chunk_size):
-                    if chunk:
-                        f.write(chunk)
-                        bar.update(len(chunk))
-        else:
-            downloaded = 0
-            with open(temp_path, "wb") as f:
+            resp = request_with_retry(
+                video_url, method="GET", headers=req_headers, stream=True, timeout=(15, 60)
+            )
+            if resp.status_code == 206:
+                open_mode = "ab"
+                total_size = curr_size + int(resp.headers.get("content-length", 0))
+            elif resp.status_code == 200:
+                open_mode = "wb"
+                curr_size = 0
+                total_size = int(resp.headers.get("content-length", 0))
+            elif resp.status_code == 416:
+                if curr_size > 10240:
+                    download_ok = True
+                    break
+                else:
+                    open_mode = "wb"
+                    curr_size = 0
+                    req_headers.pop("Range", None)
+                    resp = request_with_retry(video_url, method="GET", headers=req_headers, stream=True, timeout=(15, 60))
+                    total_size = int(resp.headers.get("content-length", 0))
+            else:
+                resp.raise_for_status()
+
+            chunk_size = 2 * 1024 * 1024
+            downloaded = curr_size
+            with open(temp_path, open_mode) as f:
                 for chunk in resp.iter_content(chunk_size=chunk_size):
                     if chunk:
                         f.write(chunk)
@@ -232,19 +264,28 @@ def download_video(video_url: str, output_path: str, referer: str = None) -> boo
                         else:
                             print(f"\rDownloading: {downloaded / (1024*1024):.1f}MB", end="", flush=True)
             print()
+            if os.path.isfile(temp_path) and os.path.getsize(temp_path) > 10240:
+                download_ok = True
+                break
+        except Exception as e:
+            curr_mb = (os.path.getsize(temp_path) / (1024*1024)) if os.path.isfile(temp_path) else 0.0
+            print(f"\n⚠️ [Stream Auto-Resume] Disconnection ({e}). Resuming from {curr_mb:.1f}MB (attempt {attempt}/5)...")
+            if attempt < 5:
+                time.sleep(min(attempt * 2, 8))
 
-        # Rename temp part file to final destination
+    if download_ok and os.path.isfile(temp_path) and os.path.getsize(temp_path) > 10240:
         if os.path.exists(output_path):
             os.remove(output_path)
         os.rename(temp_path, output_path)
         print(f"Done: {output_path}")
         return True
 
-    except Exception as e:
-        print(f"Error downloading {video_url}: {e}")
-        if os.path.exists(temp_path):
+    if os.path.exists(temp_path):
+        try:
             os.remove(temp_path)
-        return False
+        except Exception:
+            pass
+    return False
 
 
 def process_urls(urls: list[str]) -> None:
