@@ -20,6 +20,7 @@ import json
 import zipfile
 import tempfile
 import argparse
+import subprocess
 import requests
 from pathlib import Path
 
@@ -595,6 +596,59 @@ def parse_source_urls(raw_input) -> list[str]:
     return urls
 
 
+def get_file_duration(file_path: str) -> float:
+    """Extract media duration in seconds using ffprobe/ffmpeg."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            file_path
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode == 0 and res.stdout.strip():
+            return float(res.stdout.strip())
+    except Exception:
+        pass
+    return 0.0
+
+
+def split_video_parts_12h(file_path: str, duration: float, tmpdir: str) -> list[str]:
+    """Split video exceeding 12 hours into <= 12-hour parts losslessly using ffmpeg copy."""
+    max_part_sec = 43000.0  # 11h 56m 40s (safely under YouTube's strict 12-hour limit)
+    parts = []
+    p = Path(file_path)
+    start = 0.0
+    part_idx = 1
+    total_parts = int((duration + max_part_sec - 1) // max_part_sec)
+    print(f"⚠️ Video '{p.name}' duration ({duration/3600:.1f}h) exceeds YouTube's 12-hour limit!")
+    print(f"📦 Auto-splitting into {total_parts} lossless parts (<= 12 hours each)...")
+
+    while start < duration:
+        end = min(duration, start + max_part_sec)
+        out_part = Path(tmpdir) / f"{p.stem}_Part{part_idx}{p.suffix}"
+        print(f"   ✂️ Exporting Part {part_idx}/{total_parts}: {start/3600:.2f}h to {end/3600:.2f}h -> {out_part.name}...")
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start),
+            "-to", str(end),
+            "-i", file_path,
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            str(out_part)
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode == 0 and out_part.is_file():
+            parts.append(str(out_part))
+        else:
+            print(f"⚠️ Warning splitting part {part_idx}: {res.stderr.decode('utf-8', errors='replace')[-200:]}")
+            break
+        start = end
+        part_idx += 1
+
+    return parts if parts else [file_path]
+
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -667,49 +721,61 @@ def main():
             if len(all_video_pairs) > 1:
                 print(f"\n[{idx}/{len(all_video_pairs)}] ──────────────────────────")
 
-            # Determine title for this video
-            if len(all_video_pairs) == 1 and title:
-                upload_title = title
-            elif len(custom_titles) == len(all_video_pairs):
-                upload_title = custom_titles[idx - 1]
-            elif len(custom_titles) == 1 and len(all_video_pairs) > 1:
-                upload_title = f"{custom_titles[0]} (Part {idx})"
-            else:
-                upload_title = original_title
+            # Check if video duration exceeds YouTube 12-hour limit (43,200s)
+            file_dur = get_file_duration(file_path)
+            upload_files = [file_path]
+            if file_dur > 43000.0:
+                upload_files = split_video_parts_12h(file_path, file_dur, tmpdir)
 
-            # Check for video-specific timestamps file (e.g. video_name_timestamps.txt)
-            target_ts_file = timestamps_file
-            if not target_ts_file or not os.path.isfile(target_ts_file):
-                local_stem = Path(file_path).stem
-                cand_ts = Path(file_path).parent / f"{local_stem}_timestamps.txt"
-                if cand_ts.is_file():
-                    target_ts_file = str(cand_ts)
+            for part_idx, current_file in enumerate(upload_files, 1):
+                # Determine title for this video / part
+                is_sub_part = len(upload_files) > 1
+                if len(all_video_pairs) == 1 and title:
+                    base_t = title
+                elif len(custom_titles) == len(all_video_pairs):
+                    base_t = custom_titles[idx - 1]
+                elif len(custom_titles) == 1 and len(all_video_pairs) > 1:
+                    base_t = f"{custom_titles[0]} (Part {idx})"
+                else:
+                    base_t = original_title
 
-            final_desc = description
-            if target_ts_file and os.path.isfile(target_ts_file):
-                try:
-                    with open(target_ts_file, "r", encoding="utf-8") as tf:
-                        ts_text = tf.read().strip()
-                        # Extract chapter lines if full breakdown text exists
-                        if ts_text:
-                            print(f"📖 Attaching timestamps/chapters from '{target_ts_file}' to description.")
-                            if final_desc:
-                                final_desc = f"{final_desc}\n\n⏱️ Chapters / Timestamps:\n{ts_text}"
-                            else:
-                                final_desc = f"⏱️ Chapters / Timestamps:\n{ts_text}"
-                except Exception as ts_err:
-                    print(f"⚠️ Warning: Could not read timestamps file '{target_ts_file}': {ts_err}")
+                if is_sub_part:
+                    upload_title = f"{base_t} (Part {part_idx}/{len(upload_files)})"
+                else:
+                    upload_title = base_t
 
-            video_id = upload_to_youtube(
-                youtube, file_path, title=upload_title,
-                description=final_desc, tags=tags,
-                category_id=category, privacy_status=privacy,
-            )
-            results.append({
-                "id": video_id,
-                "title": upload_title,
-                "url": f"https://www.youtube.com/watch?v={video_id}",
-            })
+                # Check for video-specific timestamps file
+                target_ts_file = timestamps_file
+                if not target_ts_file or not os.path.isfile(target_ts_file):
+                    local_stem = Path(current_file).stem
+                    cand_ts = Path(current_file).parent / f"{local_stem}_timestamps.txt"
+                    if cand_ts.is_file():
+                        target_ts_file = str(cand_ts)
+
+                final_desc = description
+                if target_ts_file and os.path.isfile(target_ts_file):
+                    try:
+                        with open(target_ts_file, "r", encoding="utf-8") as tf:
+                            ts_text = tf.read().strip()
+                            if ts_text:
+                                print(f"📖 Attaching timestamps/chapters from '{target_ts_file}' to description.")
+                                if final_desc:
+                                    final_desc = f"{final_desc}\n\n⏱️ Chapters / Timestamps:\n{ts_text}"
+                                else:
+                                    final_desc = f"⏱️ Chapters / Timestamps:\n{ts_text}"
+                    except Exception as ts_err:
+                        print(f"⚠️ Warning: Could not read timestamps file '{target_ts_file}': {ts_err}")
+
+                video_id = upload_to_youtube(
+                    youtube, current_file, title=upload_title,
+                    description=final_desc, tags=tags,
+                    category_id=category, privacy_status=privacy,
+                )
+                results.append({
+                    "id": video_id,
+                    "title": upload_title,
+                    "url": f"https://www.youtube.com/watch?v={video_id}",
+                })
 
     write_outputs(results)
 
