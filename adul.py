@@ -153,18 +153,11 @@ def download_video(video_url: str, output_path: str, referer: str = None) -> boo
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    # Check if file already exists and has size
-    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-        try:
-            head_resp = request_with_retry(
-                video_url, method="HEAD", headers=download_headers, timeout=15
-            )
-            remote_size = int(head_resp.headers.get("content-length", 0))
-            if remote_size and os.path.getsize(output_path) == remote_size:
-                print(f"[SKIP] Already downloaded: {os.path.basename(output_path)} ({remote_size / (1024*1024):.1f} MB)")
-                return True
-        except Exception:
-            pass
+    # Check if file already exists and has valid size
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 10240:
+        file_sz = os.path.getsize(output_path)
+        print(f"⏩ [SKIP] Already downloaded: {os.path.basename(output_path)} ({file_sz / (1024*1024):.1f} MB)")
+        return True
 
     print(f"Downloading to: {output_path}")
     temp_path = output_path + ".part"
