@@ -7,6 +7,8 @@ large-file confirmation, folder batch-downloading, and automatic format detectio
 import os
 import re
 import sys
+import json
+import time
 import html
 import tempfile
 import urllib.parse
@@ -669,6 +671,126 @@ def get_filename_from_cd(cd_header: Optional[str]) -> Optional[str]:
     return None
 
 
+def is_valid_video_file(file_path: Union[str, Path]) -> bool:
+    """
+    Check if a file exists, is not empty/corrupted/HTML error page,
+    and is a valid video file of substantial size (> 10KB).
+    """
+    if not file_path:
+        return False
+    p = Path(file_path) if isinstance(file_path, str) else file_path
+    if not p.is_file():
+        return False
+    try:
+        sz = p.stat().st_size
+        if sz < 10240:  # Less than 10KB is an error stub or incomplete file
+            return False
+        if is_html_or_empty_file(p):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+DOWNLOAD_MANIFEST_FILENAME = "download_manifest.json"
+
+
+def load_download_manifest(dest_dir: Path) -> Dict[str, Any]:
+    manifest_path = dest_dir / DOWNLOAD_MANIFEST_FILENAME
+    if manifest_path.is_file():
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_download_manifest(dest_dir: Path, data: Dict[str, Any]):
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = dest_dir / DOWNLOAD_MANIFEST_FILENAME
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def find_cached_video(
+    url_or_id: str,
+    dest_dir: Path,
+    index: int,
+    expected_title: Optional[str] = None
+) -> Optional[Path]:
+    """
+    Multi-stage check if video for url_or_id or batch item index is already downloaded and valid.
+    Checks:
+    1. Persistent manifest (dest_dir/download_manifest.json) by URL / file_id
+    2. Expected title filename on disk
+    3. Google Drive file_id in existing filename in dest_dir
+    4. Deterministic index prefixes on disk: 01_*.mp4, 01_*.ts, etc.
+    5. Standard fallback patterns: video_01.mp4, drive_video_01.mp4, etc.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    manifest = load_download_manifest(dest_dir)
+    file_id = extract_gdrive_id(url_or_id)
+    key = file_id if file_id else url_or_id
+
+    # 1. Check in manifest by key
+    if key in manifest:
+        cached_raw = manifest[key].get("path", "")
+        if cached_raw:
+            cached_path = Path(cached_raw)
+            if is_valid_video_file(cached_path):
+                return cached_path
+        # Also check relative to dest_dir in case workspace directory moved between CI runs
+        cached_name = manifest[key].get("name", "")
+        if cached_name:
+            cand = dest_dir / cached_name
+            if is_valid_video_file(cand):
+                manifest[key]["path"] = str(cand.resolve())
+                save_download_manifest(dest_dir, manifest)
+                return cand
+
+    # 2. Check by expected title if provided
+    if expected_title:
+        safe = sanitize_filename(expected_title)
+        for cand_name in [f"{index:02d}_{safe}.mp4", f"{index}_{safe}.mp4", f"{safe}.mp4"]:
+            cand = dest_dir / cand_name
+            if is_valid_video_file(cand):
+                manifest[key] = {"path": str(cand.resolve()), "name": cand.name, "size": cand.stat().st_size}
+                save_download_manifest(dest_dir, manifest)
+                return cand
+
+    # 3. Check by Google Drive file_id in filename in dest_dir
+    if file_id:
+        for f in dest_dir.iterdir():
+            if f.is_file() and file_id in f.name and is_valid_video_file(f):
+                manifest[key] = {"path": str(f.resolve()), "name": f.name, "size": f.stat().st_size}
+                save_download_manifest(dest_dir, manifest)
+                return f
+
+    # 4. Check by deterministic index-based prefixes: 01_*.mp4, 01_*.ts, etc.
+    prefix_2d = f"{index:02d}_"
+    prefix_1d = f"{index}_"
+    for f in dest_dir.iterdir():
+        if f.is_file() and is_valid_video_file(f):
+            if f.name.startswith(prefix_2d) or f.name.startswith(prefix_1d):
+                manifest[key] = {"path": str(f.resolve()), "name": f.name, "size": f.stat().st_size}
+                save_download_manifest(dest_dir, manifest)
+                return f
+
+    # 5. Check standard legacy patterns
+    for pattern in [f"video_{index:02d}.mp4", f"drive_video_{index:02d}.mp4", f"video_{index}.mp4", f"drive_video_{index}.mp4"]:
+        cand = dest_dir / pattern
+        if is_valid_video_file(cand):
+            manifest[key] = {"path": str(cand.resolve()), "name": cand.name, "size": cand.stat().st_size}
+            save_download_manifest(dest_dir, manifest)
+            return cand
+
+    return None
+
+
 def download_with_gdown(
     url_or_id: str,
     dest_dir: Path,
@@ -676,10 +798,13 @@ def download_with_gdown(
     quiet: bool = False
 ) -> Path:
     """
-    Download single Google Drive file using gdown package, preserving
-    remote file names and valid video extensions.
+    Download single Google Drive file using gdown package with caching.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
+    cached = find_cached_video(url_or_id, dest_dir, index)
+    if cached and is_valid_video_file(cached):
+        return cached
+
     file_id = extract_gdrive_id(url_or_id)
     url = f"https://drive.google.com/uc?id={file_id}" if file_id else url_or_id
     
@@ -716,8 +841,12 @@ def download_with_gdown(
             )
         raise RuntimeError(f"Failed to download Google Drive file: {url_or_id} ({full_err})")
         
-    res_path = Path(res).resolve()
-    return ensure_video_extension(res_path)
+    res_path = ensure_video_extension(Path(res).resolve())
+    manifest = load_download_manifest(dest_dir)
+    key = file_id if file_id else url_or_id
+    manifest[key] = {"path": str(res_path.resolve()), "name": res_path.name, "size": res_path.stat().st_size}
+    save_download_manifest(dest_dir, manifest)
+    return res_path
 
 
 def download_gdrive_folder(
@@ -726,17 +855,32 @@ def download_gdrive_folder(
     quiet: bool = False
 ) -> List[Path]:
     """
-    Download all video files from a public Google Drive folder using gdown.
+    Download all video files from a public Google Drive folder using gdown with cache check.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     if not gdown:
         raise ImportError("The 'gdown' package is required to download Google Drive folders.")
         
     folder_id = extract_gdrive_id(url)
-    print(f"\n📁 Batch downloading Google Drive shared folder: {url} (ID: {folder_id or 'N/A'})...")
-    
     folder_dest = dest_dir / f"folder_{folder_id or 'shared'}"
     folder_dest.mkdir(parents=True, exist_ok=True)
+
+    # Check if folder already contains valid downloaded videos
+    existing_videos: List[Path] = []
+    for p in folder_dest.rglob("*"):
+        if p.is_file() and is_valid_video_file(p):
+            p_fixed = ensure_video_extension(p)
+            if p_fixed.suffix.lower() in SUPPORTED_EXTENSIONS:
+                if is_ts_file(p_fixed):
+                    p_fixed = convert_ts_to_mp4(p_fixed)
+                if p_fixed not in existing_videos:
+                    existing_videos.append(p_fixed)
+
+    if existing_videos:
+        print(f"⏩ [Cache Hit] Found {len(existing_videos)} already downloaded video file(s) in folder '{folder_dest.name}'. Skipping folder download.")
+        return existing_videos
+
+    print(f"\n📁 Batch downloading Google Drive shared folder: {url} (ID: {folder_id or 'N/A'})...")
     
     res_list = None
     try:
@@ -755,7 +899,7 @@ def download_gdrive_folder(
     for p in folder_dest.rglob("*"):
         if p.is_file():
             p_fixed = ensure_video_extension(p)
-            if p_fixed.suffix.lower() in SUPPORTED_EXTENSIONS:
+            if p_fixed.suffix.lower() in SUPPORTED_EXTENSIONS and is_valid_video_file(p_fixed):
                 if is_ts_file(p_fixed):
                     p_fixed = convert_ts_to_mp4(p_fixed)
                 if p_fixed not in found_videos:
@@ -773,11 +917,15 @@ def download_with_requests(
 ) -> Path:
     """
     Resilient Google Drive downloader using requests.Session with
-    virus scan confirmation token handling, permission validation, and streaming.
+    virus scan confirmation token handling, atomic part files, and permission validation.
     """
     if not requests:
         raise ImportError("The 'requests' package is required. Install via: pip install requests")
-        
+
+    cached = find_cached_video(url_or_id, dest_dir, index)
+    if cached and is_valid_video_file(cached):
+        return cached
+
     file_id = extract_gdrive_id(url_or_id)
     if not file_id:
         download_url = url_or_id
@@ -817,8 +965,6 @@ def download_with_requests(
             raise RuntimeError(f"Google Drive download quota exceeded for: {url_or_id}")
 
         # 3. Check for Google Drive Virus Scan Warning form (for files > 100MB)
-        # Google provides a <form id="download-form" action="https://drive.usercontent.google.com/download" method="get">
-        # with hidden inputs: id, export, confirm, uuid
         form_inputs = {}
         for m in re.finditer(r'<input[^>]+name="([^"]+)"[^>]+value="([^"]*)"', html_text):
             form_inputs[m.group(1)] = m.group(2)
@@ -854,41 +1000,42 @@ def download_with_requests(
             filename = f"drive_video_{index:02d}.mp4"
 
     dest_path = dest_dir / filename
+    if is_valid_video_file(dest_path):
+        return ensure_video_extension(dest_path)
+
     total_size = int(response.headers.get("content-length", 0))
-    
     downloaded = 0
     chunk_size = 4 * 1024 * 1024  # 4 MB chunks
+    temp_path = dest_path.with_name(dest_path.name + ".part")
     
     try:
-        with open(dest_path, "wb") as f:
+        with open(temp_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=chunk_size):
                 if chunk:
                     f.write(chunk)
                     downloaded += len(chunk)
                     if progress_callback:
                         progress_callback(downloaded, total_size, filename)
-    except Exception:
         if dest_path.exists():
             dest_path.unlink(missing_ok=True)
+        temp_path.rename(dest_path)
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
         raise
 
     # Validation: Ensure file is not 0 bytes and not an HTML error document
-    if not dest_path.is_file() or dest_path.stat().st_size == 0:
+    if not is_valid_video_file(dest_path):
         if dest_path.exists():
             dest_path.unlink(missing_ok=True)
-        raise RuntimeError(f"Download produced an empty file (0 bytes): {url_or_id}")
+        raise RuntimeError(f"Download produced an invalid or empty file: {url_or_id}")
 
-    with open(dest_path, "rb") as f:
-        magic = f.read(512)
-    if magic.strip().startswith(b"<!DOCTYPE") or magic.strip().startswith(b"<html") or b"<head>" in magic.lower():
-        dest_path.unlink(missing_ok=True)
-        raise PermissionError(
-            f"Google Drive returned an HTML page instead of video data for: {url_or_id}\n"
-            f"The file is PRIVATE or requires Google account sign-in.\n"
-            f"👉 Fix: Set file sharing to 'Anyone with the link' (Viewer) in Google Drive."
-        )
-
-    return ensure_video_extension(dest_path)
+    final_res = ensure_video_extension(dest_path)
+    manifest = load_download_manifest(dest_dir)
+    key = file_id if file_id else url_or_id
+    manifest[key] = {"path": str(final_res.resolve()), "name": final_res.name, "size": final_res.stat().st_size}
+    save_download_manifest(dest_dir, manifest)
+    return final_res
 
 
 def parse_resolution_height(label: str, url: str) -> int:
@@ -1221,9 +1368,19 @@ def download_webpage_video(
     progress_callback: Optional[Callable[[int, int, str], None]] = None
 ) -> Path:
     """
-    Scrapes video page, resolves best stream URL, and downloads with progress and referer.
+    Scrapes video page, resolves best stream URL, and downloads with cache verification and referer.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Quick check cache first
+    cached = find_cached_video(page_url, dest_dir, index)
+    if cached and is_valid_video_file(cached):
+        print(f"⏩ [Cache Hit] '{cached.name}' ({format_size(cached.stat().st_size)}) already downloaded. Skipping.")
+        if progress_callback:
+            sz = cached.stat().st_size
+            progress_callback(sz, sz, cached.name)
+        return cached
+
     stream_url, quality, title = extract_webpage_video_info(page_url)
     if not stream_url:
         raise ValueError(f"Could not locate playable video stream from: {page_url}")
@@ -1240,21 +1397,32 @@ def download_webpage_video(
 
     dest_path = dest_dir / filename
 
-    # Cache check
-    if dest_path.is_file() and dest_path.stat().st_size > 1024:
-        try:
-            head_resp = requests.head(stream_url, headers={"Referer": page_url, "User-Agent": WEB_HEADERS["User-Agent"]}, timeout=10)
-            remote_sz = int(head_resp.headers.get("content-length", 0))
-            if remote_sz and dest_path.stat().st_size == remote_sz:
-                print(f"⏩ [Cache Hit] '{dest_path.name}' ({format_size(remote_sz)}) already downloaded.")
-                if progress_callback:
-                    progress_callback(remote_sz, remote_sz, dest_path.name)
-                return dest_path
-        except Exception:
-            pass
+    # 2. Check if dest_path is already completely downloaded and valid
+    if is_valid_video_file(dest_path):
+        print(f"⏩ [Cache Hit] '{dest_path.name}' ({format_size(dest_path.stat().st_size)}) already downloaded. Skipping.")
+        manifest = load_download_manifest(dest_dir)
+        manifest[page_url] = {"path": str(dest_path.resolve()), "name": dest_path.name, "size": dest_path.stat().st_size}
+        save_download_manifest(dest_dir, manifest)
+        if progress_callback:
+            sz = dest_path.stat().st_size
+            progress_callback(sz, sz, dest_path.name)
+        return dest_path
+
+    # Check by index / expected title in case filename formatting differed
+    cached_cand = find_cached_video(page_url, dest_dir, index, expected_title=title)
+    if cached_cand and is_valid_video_file(cached_cand):
+        print(f"⏩ [Cache Hit] '{cached_cand.name}' ({format_size(cached_cand.stat().st_size)}) already downloaded. Skipping.")
+        if progress_callback:
+            sz = cached_cand.stat().st_size
+            progress_callback(sz, sz, cached_cand.name)
+        return cached_cand
 
     print(f"📥 Downloading: {dest_path.name} (Quality: {quality.upper() if quality else 'Auto'})")
     download_stream_file(stream_url, dest_path, referer=page_url, progress_callback=progress_callback)
+    
+    manifest = load_download_manifest(dest_dir)
+    manifest[page_url] = {"path": str(dest_path.resolve()), "name": dest_path.name, "size": dest_path.stat().st_size}
+    save_download_manifest(dest_dir, manifest)
     return dest_path
 
 
@@ -1266,28 +1434,46 @@ def download_video(
     progress_callback: Optional[Callable[[int, int, str], None]] = None
 ) -> Path:
     """
-    Download video from Webpage (4KPorno/HTML5), Google Drive, or direct URL into dest_dir.
+    Download video from Webpage (4KPorno/HTML5), Google Drive, or direct URL into dest_dir with caching.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Webpage URL
+    # 1. Check download cache first before any network requests
+    cached = find_cached_video(url_or_id, dest_dir, index)
+    if cached and is_valid_video_file(cached):
+        print(f"⏩ [Download Cache Hit] '{cached.name}' ({format_size(cached.stat().st_size)}) already downloaded. Skipping.")
+        if progress_callback:
+            sz = cached.stat().st_size
+            progress_callback(sz, sz, cached.name)
+        if is_ts_file(cached):
+            return convert_ts_to_mp4(cached)
+        return cached
+
+    # 2. Webpage URL
     if is_webpage_url(url_or_id):
         res_path = download_webpage_video(url_or_id, dest_dir=dest_dir, index=index, progress_callback=progress_callback)
-        if res_path and res_path.is_file() and is_ts_file(res_path):
-            res_path = convert_ts_to_mp4(res_path)
+        if res_path and res_path.is_file():
+            if is_ts_file(res_path):
+                res_path = convert_ts_to_mp4(res_path)
+            manifest = load_download_manifest(dest_dir)
+            manifest[url_or_id] = {"path": str(res_path.resolve()), "name": res_path.name, "size": res_path.stat().st_size}
+            save_download_manifest(dest_dir, manifest)
         return res_path
 
     file_id = extract_gdrive_id(url_or_id)
     last_err: Optional[Exception] = None
+    res_path = None
     
-    # 2. Google Drive via gdown
+    # 3. Google Drive via gdown
     if gdown and file_id:
         try:
             res_path = download_with_gdown(url_or_id, dest_dir=dest_dir, index=index, quiet=False)
-            if res_path.is_file():
+            if res_path and is_valid_video_file(res_path):
                 if progress_callback:
                     sz = res_path.stat().st_size
                     progress_callback(sz, sz, res_path.name)
+                if is_ts_file(res_path):
+                    res_path = convert_ts_to_mp4(res_path)
                 return res_path
         except PermissionError:
             raise
@@ -1295,7 +1481,7 @@ def download_video(
             last_err = e
             print(f"⚠️ gdown attempt note: {e}, falling back to requests session...")
             
-    # 3. Fallback direct requests
+    # 4. Fallback direct requests
     try:
         res_path = download_with_requests(
             url_or_id=url_or_id,
@@ -1308,8 +1494,13 @@ def download_video(
             raise req_err
         raise req_err
 
-    if res_path and res_path.is_file() and is_ts_file(res_path):
-        res_path = convert_ts_to_mp4(res_path)
+    if res_path and res_path.is_file():
+        if is_ts_file(res_path):
+            res_path = convert_ts_to_mp4(res_path)
+        manifest = load_download_manifest(dest_dir)
+        key = file_id if file_id else url_or_id
+        manifest[key] = {"path": str(res_path.resolve()), "name": res_path.name, "size": res_path.stat().st_size}
+        save_download_manifest(dest_dir, manifest)
 
     return res_path
 
@@ -1361,10 +1552,11 @@ def download_all_videos(
                     overall_callback(i, total_count, f"Downloading [{i}/{total_count}]: {fname}")
 
             try:
+                # Use deterministic 1-based index 'i' matching URL position
                 p = download_video(
                     url_or_id=url,
                     dest_dir=dest_dir,
-                    index=len(downloaded_files) + 1,
+                    index=i,
                     progress_callback=item_progress
                 )
                 if p and p.is_file() and p not in downloaded_files:
