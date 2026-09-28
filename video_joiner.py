@@ -1622,11 +1622,11 @@ def fetch_webpage_html(url: str, referer: Optional[str] = None) -> str:
     raise RuntimeError(f"Failed to fetch webpage: {url}")
 
 
-def extract_webpage_video_info(page_url: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def extract_webpage_video_streams(page_url: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """
-    Extracts the highest quality direct video URL, quality label, and title from a webpage.
+    Extracts all direct video URLs, quality labels, and title from a webpage sorted by resolution descending.
     Supports PornTrex (flashvars), TNAFlix (HTML5 size attributes), 4KPorno, and generic video pages.
-    Returns: (video_stream_url, quality_label, title)
+    Returns: (list_of_streams, title) where each item in list_of_streams is {"url": ..., "label": ..., "height": ...}
     """
     html_content = fetch_webpage_html(page_url)
 
@@ -1657,7 +1657,7 @@ def extract_webpage_video_info(page_url: str) -> Tuple[Optional[str], Optional[s
         clean_url = html.unescape(raw_url.strip())
         full_url = urllib.parse.urljoin(page_url, clean_url)
 
-        # Skip non-video files (images/posters)
+        # Skip non-video files (images/posters/subs)
         clean_path = full_url.lower().split("?")[0]
         if any(ext in clean_path for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".vtt", ".srt"]):
             return
@@ -1719,12 +1719,20 @@ def extract_webpage_video_info(page_url: str) -> Tuple[Optional[str], Optional[s
         for m in mp4_matches:
             add_candidate(m, "")
 
+    # Sort strictly by resolution height descending (highest resolution first)
+    streams.sort(key=lambda x: x["height"], reverse=True)
+    return streams, title
+
+
+def extract_webpage_video_info(page_url: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Extracts the highest quality direct video URL, quality label, and title from a webpage.
+    Returns: (video_stream_url, quality_label, title)
+    """
+    streams, title = extract_webpage_video_streams(page_url)
     if streams:
-        # Sort strictly by resolution height descending (highest first)
-        streams.sort(key=lambda x: x["height"], reverse=True)
         best = streams[0]
         return best["url"], best["label"], title
-
     return None, None, title
 
 
@@ -1732,12 +1740,14 @@ def download_stream_file(
     stream_url: str,
     target_path: Path,
     referer: str,
-    index: int = 1
-) -> None:
-    """Download video stream with high-speed multi-engine: aria2c (16 parallel connections) -> requests (4MB buffer) -> curl."""
+    index: int = 1,
+    max_retries: int = 5
+) -> bool:
+    """Download video stream with multi-engine resilience: aria2c -> requests with HTTP Range Auto-Resume -> curl -> ffmpeg."""
     temp_path = target_path.with_name(target_path.name + ".part")
+    aria2_lock = target_path.with_name(target_path.name + ".part.aria2")
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": referer,
@@ -1748,19 +1758,24 @@ def download_stream_file(
 
     download_ok = False
 
-    # 1. Ultra Fast: aria2c multi-segmented downloader (16 connections split)
+    # Clean any stale aria2 lockfile
+    if aria2_lock.exists():
+        aria2_lock.unlink(missing_ok=True)
+
+    # 1. Multi-Segmented aria2c (8 connections for optimal CDN stability without tripping anti-bot limits)
     aria2_bin = "aria2c.exe" if sys.platform == "win32" else "aria2c"
     aria2_path = shutil.which(aria2_bin) or shutil.which("aria2c")
     if aria2_path:
         try:
-            print(f"⚡ [Multi-Threaded Download] Using aria2c (16 parallel streams)...")
+            print(f"⚡ [Multi-Threaded Download] Using aria2c (8 parallel streams)...")
             aria2_cmd = [
                 str(aria2_path),
-                "-x", "16",
-                "-s", "16",
-                "-j", "16",
+                "-x", "8",
+                "-s", "8",
+                "-j", "8",
                 "-k", "1M",
                 "--file-allocation=none",
+                "--check-certificate=false",
                 "--header", f"Referer: {referer}",
                 "--header", f"User-Agent: {headers['User-Agent']}",
                 "--header", f"Accept: {headers['Accept']}",
@@ -1779,62 +1794,142 @@ def download_stream_file(
             if res.returncode == 0 and temp_path.is_file() and temp_path.stat().st_size > 10240:
                 download_ok = True
                 print(f"⚡ Download finished with aria2c ({format_size(temp_path.stat().st_size)}).")
+            else:
+                if aria2_lock.exists():
+                    aria2_lock.unlink(missing_ok=True)
         except Exception as e:
             print(f"⚠️ aria2c note: {e}")
+            if aria2_lock.exists():
+                aria2_lock.unlink(missing_ok=True)
             download_ok = False
 
-    # 2. Fast Streaming requests (4MB buffer)
+    # 2. Resilient Streaming requests with HTTP Range Resumption & Auto-Retry Loop
     if not download_ok and requests:
-        try:
-            with requests.get(stream_url, headers=headers, stream=True, timeout=60) as resp:
-                if resp.status_code == 200:
-                    total_size = int(resp.headers.get("content-length", 0))
-                    downloaded = 0
-                    chunk_size = 4 * 1024 * 1024  # 4MB buffer for maximum I/O throughput
-                    with open(temp_path, "wb") as f:
+        session = requests.Session()
+        for attempt in range(1, max_retries + 1):
+            try:
+                curr_size = temp_path.stat().st_size if (temp_path.exists() and temp_path.is_file()) else 0
+                req_headers = headers.copy()
+                if curr_size > 0:
+                    req_headers["Range"] = f"bytes={curr_size}-"
+
+                with session.get(stream_url, headers=req_headers, stream=True, timeout=(15, 60)) as resp:
+                    if resp.status_code == 206:
+                        open_mode = "ab"
+                        total_expected = curr_size + int(resp.headers.get("content-length", 0))
+                    elif resp.status_code == 200:
+                        open_mode = "wb"
+                        curr_size = 0
+                        total_expected = int(resp.headers.get("content-length", 0))
+                    elif resp.status_code == 416:
+                        # Range Not Satisfiable (file may be complete or range past EOF)
+                        if curr_size > 10240:
+                            download_ok = True
+                            break
+                        else:
+                            open_mode = "wb"
+                            curr_size = 0
+                            req_headers.pop("Range", None)
+                            with session.get(stream_url, headers=req_headers, stream=True, timeout=(15, 60)) as full_resp:
+                                total_expected = int(full_resp.headers.get("content-length", 0))
+                                with open(temp_path, "wb") as f:
+                                    for chunk in full_resp.iter_content(chunk_size=2 * 1024 * 1024):
+                                        if chunk:
+                                            f.write(chunk)
+                                            curr_size += len(chunk)
+                                            if total_expected:
+                                                pct = (curr_size / total_expected) * 100
+                                                print(f"\r  [{index:02d}] {curr_size / (1024*1024):.1f}MB / {total_expected / (1024*1024):.1f}MB ({pct:.1f}%)", end="", flush=True)
+                                print()
+                                if temp_path.is_file() and temp_path.stat().st_size > 10240:
+                                    download_ok = True
+                                    break
+                    else:
+                        resp.raise_for_status()
+
+                    chunk_size = 2 * 1024 * 1024  # 2MB buffer for high throughput
+                    with open(temp_path, open_mode) as f:
                         for chunk in resp.iter_content(chunk_size=chunk_size):
                             if chunk:
                                 f.write(chunk)
-                                downloaded += len(chunk)
-                                if total_size:
-                                    pct = (downloaded / total_size) * 100
-                                    print(f"\r  [{index:02d}] {downloaded / (1024*1024):.1f}MB / {total_size / (1024*1024):.1f}MB ({pct:.1f}%)", end="", flush=True)
+                                curr_size += len(chunk)
+                                if total_expected:
+                                    pct = (curr_size / total_expected) * 100
+                                    print(f"\r  [{index:02d}] {curr_size / (1024*1024):.1f}MB / {total_expected / (1024*1024):.1f}MB ({pct:.1f}%)", end="", flush=True)
                     print()
                     if temp_path.is_file() and temp_path.stat().st_size > 10240:
                         download_ok = True
-        except Exception as e:
-            print(f"⚠️ requests download note: {e}")
-            download_ok = False
+                        break
+            except Exception as e:
+                curr_mb = (temp_path.stat().st_size / (1024*1024)) if (temp_path.exists() and temp_path.is_file()) else 0.0
+                print(f"\n⚠️ [Stream Auto-Resume] Disconnection ({e}). Resuming from {curr_mb:.1f}MB (attempt {attempt}/{max_retries})...")
+                if attempt < max_retries:
+                    time.sleep(min(attempt * 2, 8))
 
-    # 3. Fallback to curl
+    # 3. Fallback to curl with continue/resume (-C -)
     if not download_ok:
         curl_bin = "curl.exe" if sys.platform == "win32" else "curl"
         curl_cmd = [
-            curl_bin, "-L",
+            curl_bin, "-sSL", "-k",
+            "-C", "-",
             "-A", headers["User-Agent"],
             "-H", f"Referer: {referer}",
+            "-H", f"Accept: {headers['Accept']}",
             "-o", str(temp_path),
-            "--retry", "3",
+            "--retry", "5",
             "--retry-delay", "2",
+            "--retry-all-errors",
+            "--connect-timeout", "20",
             stream_url
         ]
-        res = subprocess.run(curl_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if res.returncode == 0 and temp_path.is_file() and temp_path.stat().st_size > 10240:
-            download_ok = True
+        try:
+            res = subprocess.run(curl_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if res.returncode == 0 and temp_path.is_file() and temp_path.stat().st_size > 10240:
+                download_ok = True
+                print(f"⚡ Download finished with curl ({format_size(temp_path.stat().st_size)}).")
+        except Exception as e:
+            print(f"⚠️ curl note: {e}")
+
+    # 4. Fallback to ffmpeg stream copy
+    if not download_ok:
+        ffmpeg_bin = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+        ffmpeg_path = shutil.which(ffmpeg_bin) or shutil.which("ffmpeg")
+        if ffmpeg_path:
+            try:
+                print(f"🔄 Attempting ffmpeg stream copy fallback...")
+                ff_cmd = [
+                    str(ffmpeg_path), "-y",
+                    "-headers", f"User-Agent: {headers['User-Agent']}\r\nReferer: {referer}\r\n",
+                    "-i", stream_url,
+                    "-c", "copy",
+                    "-bsf:a", "aac_adtstoasc",
+                    str(temp_path)
+                ]
+                res = subprocess.run(ff_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+                if res.returncode == 0 and temp_path.is_file() and temp_path.stat().st_size > 10240:
+                    download_ok = True
+                    print(f"⚡ Download finished with ffmpeg.")
+            except Exception as e:
+                print(f"⚠️ ffmpeg note: {e}")
 
     if not download_ok or not temp_path.is_file() or temp_path.stat().st_size < 10240:
         if temp_path.exists():
-            temp_path.unlink()
-        raise RuntimeError(f"Failed to download video stream from: {stream_url}")
+            temp_path.unlink(missing_ok=True)
+        if aria2_lock.exists():
+            aria2_lock.unlink(missing_ok=True)
+        return False
 
     if target_path.exists():
-        target_path.unlink()
+        target_path.unlink(missing_ok=True)
+    if aria2_lock.exists():
+        aria2_lock.unlink(missing_ok=True)
     temp_path.rename(target_path)
+    return True
 
 
 def download_webpage_video(page_url: str, dest_dir: Path, index: int = 1) -> Path:
     """
-    Scrapes video page, resolves best stream URL, and downloads with cache verification and referer.
+    Scrapes video page, resolves best stream URL (with multi-quality fallback), and downloads with cache verification and referer.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1844,15 +1939,20 @@ def download_webpage_video(page_url: str, dest_dir: Path, index: int = 1) -> Pat
         print(f"⏩ [Cache Hit] '{cached.name}' ({format_size(cached.stat().st_size)}) already downloaded. Skipping.")
         return cached
 
-    stream_url, quality, title = extract_webpage_video_info(page_url)
-    if not stream_url:
+    streams, title = extract_webpage_video_streams(page_url)
+    if not streams:
+        # Retry once after a brief delay
+        time.sleep(2)
+        streams, title = extract_webpage_video_streams(page_url)
+
+    if not streams:
         raise ValueError(f"Could not locate playable video stream from: {page_url}")
 
     if title:
         safe = sanitize_filename(title)
         filename = f"{index:02d}_{safe}.mp4"
     else:
-        raw_path = urllib.parse.urlparse(stream_url).path.rstrip("/")
+        raw_path = urllib.parse.urlparse(streams[0]["url"]).path.rstrip("/")
         stem = os.path.basename(raw_path) or f"video_{index:02d}.mp4"
         filename = f"{index:02d}_{stem}" if not stem.startswith(f"{index:02d}_") else stem
         if not filename.endswith(".mp4"):
@@ -1874,13 +1974,37 @@ def download_webpage_video(page_url: str, dest_dir: Path, index: int = 1) -> Pat
         print(f"⏩ [Cache Hit] '{cached_cand.name}' ({format_size(cached_cand.stat().st_size)}) already downloaded. Skipping.")
         return cached_cand
 
-    print(f"📥 Downloading: {dest_path.name} (Quality: {quality.upper() if quality else 'Auto'})")
-    download_stream_file(stream_url, dest_path, referer=page_url, index=index)
-    
-    manifest = load_download_manifest(dest_dir)
-    manifest[page_url] = {"path": str(dest_path.resolve()), "name": dest_path.name, "size": dest_path.stat().st_size}
-    save_download_manifest(dest_dir, manifest)
-    return dest_path
+    # 3. Try each stream candidate in order of quality
+    for stream_cand in streams:
+        stream_url = stream_cand["url"]
+        quality = stream_cand["label"]
+        print(f"📥 Downloading: {dest_path.name} (Quality: {quality.upper() if quality else 'Auto'})")
+        ok = download_stream_file(stream_url, dest_path, referer=page_url, index=index)
+        if ok and is_valid_video_file(dest_path):
+            manifest = load_download_manifest(dest_dir)
+            manifest[page_url] = {"path": str(dest_path.resolve()), "name": dest_path.name, "size": dest_path.stat().st_size}
+            save_download_manifest(dest_dir, manifest)
+            return dest_path
+        print(f"⚠️ Stream quality ({quality}) failed. Trying alternative stream quality...")
+
+    # 4. If all initial streams failed, re-fetch the webpage fresh once (in case tokens expired during previous long downloads)
+    try:
+        print(f"🔄 Refreshing page stream tokens and re-trying...")
+        time.sleep(2)
+        fresh_streams, _ = extract_webpage_video_streams(page_url)
+        for stream_cand in fresh_streams:
+            stream_url = stream_cand["url"]
+            quality = stream_cand["label"]
+            ok = download_stream_file(stream_url, dest_path, referer=page_url, index=index)
+            if ok and is_valid_video_file(dest_path):
+                manifest = load_download_manifest(dest_dir)
+                manifest[page_url] = {"path": str(dest_path.resolve()), "name": dest_path.name, "size": dest_path.stat().st_size}
+                save_download_manifest(dest_dir, manifest)
+                return dest_path
+    except Exception as e:
+        print(f"⚠️ Page refresh retry note: {e}")
+
+    raise RuntimeError(f"Failed to download video stream from: {page_url}")
 
 
 
