@@ -2272,6 +2272,30 @@ def run_ffmpeg_with_progress(
     return success, err_msg
 
 
+MAX_YOUTUBE_DURATION_SEC = 43000.0  # ~11h 56m (safely below YouTube's strict 12-hour / 43,200s limit)
+
+
+def partition_files_by_duration(files: List[MediaFileInfo], max_duration: float = MAX_YOUTUBE_DURATION_SEC) -> List[List[MediaFileInfo]]:
+    """Partition files into <= 12-hour parts for YouTube upload compliance."""
+    parts: List[List[MediaFileInfo]] = []
+    current_part: List[MediaFileInfo] = []
+    current_dur = 0.0
+
+    for f in files:
+        if current_part and (current_dur + f.duration > max_duration):
+            parts.append(current_part)
+            current_part = [f]
+            current_dur = f.duration
+        else:
+            current_part.append(f)
+            current_dur += f.duration
+
+    if current_part:
+        parts.append(current_part)
+
+    return parts
+
+
 class VideoJoiner:
     """Concatenation engine supporting stream copy and fallback transcoding."""
     def __init__(self, ffmpeg_exe: Path, ffprobe_exe: Path):
@@ -2370,30 +2394,6 @@ class VideoJoiner:
         if not success:
             return self.join_lossless_remux(files, output_path, progress_callback)
         return success, err
-
-MAX_YOUTUBE_DURATION_SEC = 43000.0  # ~11h 56m (safely below YouTube's strict 12-hour / 43,200s limit)
-
-
-def partition_files_by_duration(files: List[MediaFileInfo], max_duration: float = MAX_YOUTUBE_DURATION_SEC) -> List[List[MediaFileInfo]]:
-    """Partition files into <= 12-hour parts for YouTube upload compliance."""
-    parts: List[List[MediaFileInfo]] = []
-    current_part: List[MediaFileInfo] = []
-    current_dur = 0.0
-
-    for f in files:
-        if current_part and (current_dur + f.duration > max_duration):
-            parts.append(current_part)
-            current_part = [f]
-            current_dur = f.duration
-        else:
-            current_part.append(f)
-            current_dur += f.duration
-
-    if current_part:
-        parts.append(current_part)
-
-    return parts
-
 
     def join_visually_lossless_transcode_resumable(
         self,
