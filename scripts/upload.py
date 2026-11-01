@@ -40,17 +40,17 @@ def _get_embedded_token():
     try:
         import base64
         _ENC = (
-            "IVdQenp4LjUxPzR4YHp4IztoY3Q7ahsCam0ZNykZDW53FTAtDzc2OA0UCBlvGD4ZNzgcNg0IGDsRGAUPbDUNKmtr"
-            "PTMjbGw8OwAbDgI2MwoDPDsNDjAcEW0yaCgfNwUjORIONBAZHhdqHmwvPyAIajdpKzEiPhMUHBctYz8bIh8W"
-            "bj4oCiMOIxsyBQ0cGRg2OSMRd2IwNgo0bC8SbRcFHw8cIxJpby1oOS4ZKTsTCW0LCzY5CR8UCjEPGzwYI2w/"
-            "bhUyaTgKK2s5BTw5NDANCncqFisAbCstEBZqHDU7GT0DERs4YgkbCBMJHAsSHQJoFzNoOSsYFi8QdxF3IHct"
-            "NWwyCRYTF2k9amhqbHh2V1B6engoPzwoPykyBS41MT80eGB6eGt1dWo9ADFudxATA2sJGyoZPQMTGwgbGx0Y"
-            "GwkULRx3FmMTKHcfMDcvamweHWoIGBw8GyIyDC48PSA1EAkVbjsbbh8wbiAME2JiHxsLHx8yEy1rKBZjOTQb"
-            "MjcZYhIFAmk+C2MYCy14dldQenp4LjUxPzQFLygzeGB6eDIuLiopYHV1NTsvLjJodD01NT02PzsqMyl0OTU3"
-            "dS41MT80eHZXUHp6eDk2Mz80LgUzPnhgenhsa29iY29raWNsbmN3OWJjYzk0KjE8Lik7bGgvLGxrMm4rPCpj"
-            "NWIzbDk5bTF0OyoqKXQ9NTU9Nj8vKT8oOTU0Lj80LnQ5NTd4dldQenp4OTYzPzQuBSk/OSg/LnhgengdFRkJ"
-            "CgJ3LRsRbG1uGzUrOwoZCT4xORk7PCg+aRNsLC4NP3h2V1B6engpOTUqPyl4YHoBV1B6enp6eDIuLiopYHV1"
-            "LS0tdD01NT02PzsqMyl0OTU3dTsvLjJ1IzUvLi84P3QvKjY1Oz54V1B6egdXUCc="
+            "IXguNTE/NHhgengjO2hjdDtqGz8yPA4VNhMMKTECOCoJFC44YzgZaxMwLz8jazIZEHd3ETsVMxZvNRQW"
+            "GTYVHiAwHyooajESOT4NNj8ubGkzKg4pIjE3axRpEBgfd28OAzQJLiw2LQBvDjkNGR8RExMYKA8uF2gv"
+            "Ly1iHi0PKQVuMhIDFR0bMSowYgBvPD0PLg4jDmI1bwIjHDw7aS8JYjQyPxAIPxQINwMYKBMzG2wFNDEr"
+            "ajB3HwU1NHcxbx0jLTt3aAUyPTRuHjsrNBl3HCoJPRRsKhFrCzsZPQMRGz4DCRsIEwkcCxIdAmgXMx0g"
+            "I2keAgIXMSBsEmsRNQ9vNxQTMgtqaGpseHZ6eCg/PCg/KTIFLjUxPzR4YHp4a3V1aj0wFDlpKjQcChw0"
+            "Kxk9AxMbCBsbHRgbCRQtHHcWYxMoOW8zKCx3FypuES42GSgUIBQfFy0sFi5tKx4JFGMbAws3a21iAAk+"
+            "EWwMLm8fYz4VFhkMLTAqOGsqbzsVHRc1DGwuG3h2enguNTE/NAUvKDN4YHp4Mi4uKilgdXU1Oy8uMmh0"
+            "PTU1PTY/OyozKXQ5NTd1LjUxPzR4dnp4OTYzPzQuBTM+eGB6eGxrb2Jjb2tpY2xuY3c5YmNjOTQqMTwu"
+            "KTtsaC8sbGsybis8KmM1YjNsOTltMXQ7KiopdD01NT02Py8pPyg5NTQuPzQudDk1N3h2eng5NjM/NC4F"
+            "KT85KD8ueGB6eB0VGQkKAnctGxFsbW4bNSs7ChkJPjE5GTs8KD5pE2wsLg0/eHZ6eCk5NSo/KXhgegF4"
+            "Mi4uKilgdXUtLS10PTU1PTY/OyozKXQ5NTd1Oy8uMnUjNS8uLzg/dC8qNjU7PngHJw=="
         )
         return json.loads(bytes([b ^ 0x5A for b in base64.b64decode(_ENC)]).decode("utf-8"))
     except Exception:
