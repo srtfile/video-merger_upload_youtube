@@ -192,6 +192,7 @@ jobs:
     name: 🎬 Batch ${{ matrix.batch.index }} - ${{ matrix.batch.name }}
     needs: prepare-batches
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -330,8 +331,10 @@ jobs:
           echo "========================================================"
           echo "🚀 Batch ${{ matrix.batch.index }} reached runtime safety limit."
           echo "   Checkpoint has been saved to cache."
-          echo "   Auto-triggering continuation run for Batch ${{ matrix.batch.index }}..."
+          echo "⏳ Waiting 5 minutes (300 seconds) cooldown before restarting..."
           echo "========================================================"
+          sleep 300
+          echo "🚀 Auto-triggering continuation run for Batch ${{ matrix.batch.index }}..."
           gh workflow run main.yml \
             --ref "${{ github.ref_name }}" \
             -f video_urls="${{ inputs.video_urls }}" \
@@ -344,7 +347,11 @@ jobs:
             -f upload_release="${{ inputs.upload_release }}" \
             -f upload_youtube="${{ inputs.upload_youtube }}" \
             -f youtube_privacy="${{ inputs.youtube_privacy || 'private' }}" \
-            -f youtube_title="${{ inputs.youtube_title }}"
+            -f youtube_title="${{ inputs.youtube_title }}" || {
+              echo "⚠️ Could not trigger workflow automatically."
+              echo "   Make sure you have added a 'GH_PAT' repository secret (Personal Access Token with 'workflow' scope)"
+              echo "   because GitHub restricts default GITHUB_TOKEN from triggering new workflow runs."
+            }
 
       - name: 📤 Upload Merged Video Artifact (${{ matrix.batch.name }})
         if: steps.merge_step.outputs.completed == 'true'
