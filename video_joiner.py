@@ -3123,7 +3123,7 @@ def main():
     parser.add_argument("--crf", type=int, default=17, help="Transcode CRF.")
     parser.add_argument("--preset", default="veryfast", choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"], help="x264 transcode speed preset (default: veryfast).")
     parser.add_argument("--cache-dir", default=None, help="Segment cache directory for resumable processing.")
-    parser.add_argument("--max-runtime", type=int, default=350, help="Maximum execution runtime in minutes before saving checkpoint (default: 350 / 5 hours 50 minutes).")
+    parser.add_argument("--max-runtime", type=int, default=320, help="Maximum execution runtime in minutes before saving checkpoint (default: 320 / 5 hours 20 minutes).")
     parser.add_argument("--sort", choices=["natural", "alphabetical", "date", "size", "none"], default="natural", help="Sort order.")
     parser.add_argument("--reverse", action="store_true", help="Reverse sort.")
     parser.add_argument("-y", "--yes", action="store_true", help="Overwrite without asking.")
