@@ -61,10 +61,15 @@ on:
           - medium
           - slow
       max_runtime:
-        description: 'Safety max runtime in minutes before saving checkpoint and auto-continuing (default: 350 mins / 5 hours 50 minutes)'
+        description: 'Safety max runtime in minutes before saving checkpoint and auto-continuing (default: 320 mins / 5 hours 20 minutes)'
         required: false
         type: number
-        default: 350
+        default: 320
+      is_continuation:
+        description: 'Internal: whether this run is continuing from a previous run'
+        required: false
+        type: boolean
+        default: false
       upload_release:
         description: 'Create a GitHub Release with the merged video for direct public download?'
         required: false
@@ -203,8 +208,19 @@ jobs:
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
 
+      - name: ⏳ Auto-Continuation Cooldown (Wait 5 Minutes Before Resuming)
+        if: ${{ inputs.is_continuation == true }}
+        run: |
+          DELAY="${{ inputs.batch_delay || 300 }}"
+          echo "========================================================"
+          echo "⏳ AUTO-CONTINUATION COOLDOWN ACTIVE"
+          echo "   Waiting $DELAY seconds (5 minutes) before resuming..."
+          echo "   Target Batch ${{ matrix.batch.index }}: ${{ matrix.batch.name }}"
+          echo "========================================================"
+          sleep "$DELAY"
+
       - name: ⏳ Cooldown Delay (Auto Wait Before Next Video)
-        if: ${{ matrix.batch.index > 1 && !matrix.batch.force_no_delay }}
+        if: ${{ matrix.batch.index > 1 && !matrix.batch.force_no_delay && inputs.is_continuation != true }}
         run: |
           DELAY="${{ inputs.batch_delay || 300 }}"
           echo "========================================================"
@@ -277,7 +293,7 @@ jobs:
           JOIN_MODE: ${{ inputs.join_mode }}
           SORT_ORDER: ${{ inputs.sort_order }}
           PRESET: ${{ inputs.preset || 'veryfast' }}
-          MAX_RUNTIME: ${{ inputs.max_runtime || 350 }}
+          MAX_RUNTIME: ${{ inputs.max_runtime || 320 }}
           CI: 'true'
         run: |
           echo "========================================================"
@@ -315,7 +331,7 @@ jobs:
           fi
 
       - name: 💾 Save Video Downloads & Segments Checkpoint Cache
-        if: always()
+        if: always() && steps.merge_step.conclusion != 'skipped' && steps.merge_step.outputs.completed != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -323,35 +339,28 @@ jobs:
             .video_cache/
           key: video-cache-${{ matrix.batch.name }}-${{ github.run_id }}
 
-      - name: 🔄 Auto-Restart Continuation Run (if time budget reached)
-        if: always() && steps.merge_step.outputs.completed != 'true' && (steps.merge_step.outputs.resumed_needed == 'true' || cancelled())
+      - name: 🔄 Auto-Restart Continuation Run (if task not finished within time limit)
+        if: always() && steps.merge_step.conclusion != 'skipped' && steps.merge_step.outputs.completed != 'true'
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          INPUT_VIDEO_URLS: ${{ inputs.video_urls }}
+          BATCH_INDEX: ${{ matrix.batch.index }}
+          TOTAL_BATCHES: ${{ needs.prepare-batches.outputs.total_batches }}
+          OUTPUT_FILENAME: ${{ inputs.output_filename }}
+          JOIN_MODE: ${{ inputs.join_mode }}
+          SORT_ORDER: ${{ inputs.sort_order }}
+          PRESET: ${{ inputs.preset || 'veryfast' }}
+          MAX_RUNTIME: ${{ inputs.max_runtime || 320 }}
+          UPLOAD_RELEASE: ${{ inputs.upload_release }}
+          UPLOAD_YOUTUBE: ${{ inputs.upload_youtube }}
+          YOUTUBE_PRIVACY: ${{ inputs.youtube_privacy || 'private' }}
+          YOUTUBE_TITLE: ${{ inputs.youtube_title }}
+          BATCH_DELAY: ${{ inputs.batch_delay || 300 }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GH_PAT: ${{ secrets.GH_PAT || secrets.PAT || secrets.PERSONAL_ACCESS_TOKEN || secrets.GITHUB_PAT || secrets.WORKFLOW_TOKEN || secrets.GH_TOKEN || secrets.ACTIONS_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "========================================================"
-          echo "🚀 Batch ${{ matrix.batch.index }} reached runtime safety limit."
-          echo "   Checkpoint has been saved to cache."
-          echo "⏳ Waiting 5 minutes (300 seconds) cooldown before restarting..."
-          echo "========================================================"
-          sleep 300
-          echo "🚀 Auto-triggering continuation run for Batch ${{ matrix.batch.index }}..."
-          gh workflow run main.yml \
-            --ref "${{ github.ref_name }}" \
-            -f video_urls="${{ inputs.video_urls }}" \
-            -f batch_range="${{ matrix.batch.index }}" \
-            -f output_filename="${{ inputs.output_filename }}" \
-            -f join_mode="${{ inputs.join_mode }}" \
-            -f preset="${{ inputs.preset || 'veryfast' }}" \
-            -f sort_order="${{ inputs.sort_order }}" \
-            -f max_runtime="${{ inputs.max_runtime || 350 }}" \
-            -f upload_release="${{ inputs.upload_release }}" \
-            -f upload_youtube="${{ inputs.upload_youtube }}" \
-            -f youtube_privacy="${{ inputs.youtube_privacy || 'private' }}" \
-            -f youtube_title="${{ inputs.youtube_title }}" || {
-              echo "⚠️ Could not trigger workflow automatically."
-              echo "   Make sure you have added a 'GH_PAT' repository secret (Personal Access Token with 'workflow' scope)"
-              echo "   because GitHub restricts default GITHUB_TOKEN from triggering new workflow runs."
-            }
+          python scripts/trigger_continuation.py
 
       - name: 📤 Upload Merged Video Artifact (${{ matrix.batch.name }})
         if: steps.merge_step.outputs.completed == 'true'
