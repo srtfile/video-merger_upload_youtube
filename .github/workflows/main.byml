@@ -48,10 +48,10 @@ on:
         type: number
         default: 300
       preset:
-        description: 'Transcode Speed Preset (veryfast avoids 6h timeout; 10x faster with intact visual quality)'
+        description: 'Transcode Speed Preset (ultrafast for maximum GitHub Actions speed; visually lossless)'
         required: false
         type: choice
-        default: 'veryfast'
+        default: 'ultrafast'
         options:
           - ultrafast
           - superfast
@@ -60,6 +60,11 @@ on:
           - fast
           - medium
           - slow
+      crf:
+        description: 'Transcode Quality (CRF: 17=near lossless, 20=visually lossless & 2x faster, 23=standard)'
+        required: false
+        type: number
+        default: 20
       max_runtime:
         description: 'Safety max runtime in minutes before saving checkpoint and auto-continuing (default: 320 mins / 5 hours 20 minutes)'
         required: false
@@ -208,6 +213,16 @@ jobs:
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
 
+      - name: 🧹 Free Runner Disk Space (Maximum NVMe Performance)
+        run: |
+          echo "========================================================"
+          echo "🧹 Freeing runner disk space for large video files..."
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          echo "Available disk space after optimization:"
+          df -h /
+          echo "========================================================"
+
       - name: ⏳ Auto-Continuation Cooldown (Wait 5 Minutes Before Resuming)
         if: ${{ inputs.is_continuation == true }}
         run: |
@@ -273,16 +288,35 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 💾 Restore Video Downloads & Normalized Segments Cache
+      - name: 💾 Restore Video Segments Checkpoint Cache
         uses: actions/cache/restore@v4
         id: cache-restore
         with:
-          path: |
-            downloads/
-            .video_cache/
+          path: .video_cache/
           key: video-cache-${{ matrix.batch.name }}-${{ github.run_id }}
           restore-keys: |
             video-cache-${{ matrix.batch.name }}-
+
+      - name: 💾 Restore Video Segments Checkpoint from Artifact (Fallback)
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ARTIFACT_NAME: video-checkpoint-${{ matrix.batch.artifact_name }}
+        run: |
+          echo "🔍 Checking for fallback checkpoint artifact '$ARTIFACT_NAME'..."
+          PREV_RUN_ID=$(gh api "repos/$REPO/actions/artifacts?name=$ARTIFACT_NAME&per_page=1" --jq '.artifacts[0].workflow_run.id' 2>/dev/null || true)
+          if [ -n "$PREV_RUN_ID" ] && [ "$PREV_RUN_ID" != "null" ]; then
+            echo "📦 Found checkpoint in workflow run $PREV_RUN_ID. Downloading..."
+            mkdir -p .video_cache
+            gh run download "$PREV_RUN_ID" -R "$REPO" -n "$ARTIFACT_NAME" --dir .video_cache/ 2>/dev/null || true
+            if [ -d ".video_cache" ]; then
+              echo "✅ Checkpoint restored successfully from artifact fallback!"
+              ls -lhR .video_cache/ || true
+            fi
+          else
+            echo "ℹ️ No previous checkpoint artifact found. Fresh run will begin."
+          fi
 
       - name: "🚀 Download & Merge Losslessly (Batch ${{ matrix.batch.index }} - ${{ matrix.batch.name }})"
         id: merge_step
@@ -292,17 +326,19 @@ jobs:
           OUTPUT_TARGET: ${{ matrix.batch.output }}
           JOIN_MODE: ${{ inputs.join_mode }}
           SORT_ORDER: ${{ inputs.sort_order }}
-          PRESET: ${{ inputs.preset || 'veryfast' }}
+          PRESET: ${{ inputs.preset || 'ultrafast' }}
+          CRF: ${{ inputs.crf || 20 }}
           MAX_RUNTIME: ${{ inputs.max_runtime || 320 }}
           CI: 'true'
         run: |
           echo "========================================================"
           echo "🎬 Processing Batch ${{ matrix.batch.index }}: ${{ matrix.batch.name }}"
-          echo "🎯 Target File:   $OUTPUT_TARGET"
-          echo "⚙️ Join Mode:     $JOIN_MODE"
-          echo "🗂️ Sort Order:    $SORT_ORDER"
-          echo "⚡ Transcode Preset: $PRESET (10x fast encoding)"
-          echo "⏱️ Max Runtime:   $MAX_RUNTIME minutes safety limit"
+          echo "🎯 Target File:       $OUTPUT_TARGET"
+          echo "⚙️ Join Mode:         $JOIN_MODE"
+          echo "🗂️ Sort Order:        $SORT_ORDER"
+          echo "⚡ Transcode Preset:  $PRESET (Maximum GitHub Speed)"
+          echo "🎨 Transcode CRF:     $CRF"
+          echo "⏱️ Max Runtime:       $MAX_RUNTIME minutes safety limit"
           echo "========================================================"
           
           CACHE_DIR=".video_cache/${{ matrix.batch.name }}"
@@ -314,6 +350,7 @@ jobs:
               -m "$JOIN_MODE" \
               --sort "$SORT_ORDER" \
               --preset "$PRESET" \
+              --crf "$CRF" \
               --max-runtime "$MAX_RUNTIME" \
               --cache-dir "$CACHE_DIR" \
               -y
@@ -325,19 +362,27 @@ jobs:
               -m "$JOIN_MODE" \
               --sort "$SORT_ORDER" \
               --preset "$PRESET" \
+              --crf "$CRF" \
               --max-runtime "$MAX_RUNTIME" \
               --cache-dir "$CACHE_DIR" \
               -y
           fi
 
-      - name: 💾 Save Video Downloads & Segments Checkpoint Cache
+      - name: 💾 Save Video Segments Checkpoint Cache
         if: always() && steps.merge_step.conclusion != 'skipped' && steps.merge_step.outputs.completed != 'true'
         uses: actions/cache/save@v4
         with:
-          path: |
-            downloads/
-            .video_cache/
+          path: .video_cache/
           key: video-cache-${{ matrix.batch.name }}-${{ github.run_id }}
+
+      - name: 💾 Save Checkpoint Artifact (Guaranteed Backup if Cache Exceeds Limit)
+        if: always() && steps.merge_step.conclusion != 'skipped' && steps.merge_step.outputs.completed != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-checkpoint-${{ matrix.batch.artifact_name }}
+          path: .video_cache/
+          retention-days: 7
+          overwrite: true
 
       - name: 🔄 Auto-Restart Continuation Run (if task not finished within time limit)
         if: always() && steps.merge_step.conclusion != 'skipped' && steps.merge_step.outputs.completed != 'true'
@@ -348,7 +393,8 @@ jobs:
           OUTPUT_FILENAME: ${{ inputs.output_filename }}
           JOIN_MODE: ${{ inputs.join_mode }}
           SORT_ORDER: ${{ inputs.sort_order }}
-          PRESET: ${{ inputs.preset || 'veryfast' }}
+          PRESET: ${{ inputs.preset || 'ultrafast' }}
+          CRF: ${{ inputs.crf || 20 }}
           MAX_RUNTIME: ${{ inputs.max_runtime || 320 }}
           UPLOAD_RELEASE: ${{ inputs.upload_release }}
           UPLOAD_YOUTUBE: ${{ inputs.upload_youtube }}
