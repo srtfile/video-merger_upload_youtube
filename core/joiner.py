@@ -537,7 +537,7 @@ class VideoJoiner:
                 and v_info.width == target_w
                 and v_info.height == target_h
                 and (abs((v_info.fps or 0) - target_fps) < 0.1 or target_fps <= 0)
-                and (v_info.pix_fmt or "yuv420p").lower() in ("yuv420p", "yuvj420p")
+                and (getattr(v_info, "pix_fmt", None) or getattr(v_info, "pixel_format", None) or "yuv420p").lower() in ("yuv420p", "yuvj420p")
             )
 
             if v_info and v_info.width == target_w and v_info.height == target_h and abs((v_info.fps or 0) - target_fps) < 0.05:

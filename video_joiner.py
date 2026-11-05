@@ -209,6 +209,13 @@ class VideoStreamInfo:
     bitrate: int = 0
     pixel_format: str = ""
     aspect_ratio: str = ""
+    pix_fmt: str = ""
+
+    def __post_init__(self):
+        if not self.pix_fmt and self.pixel_format:
+            self.pix_fmt = self.pixel_format
+        elif not self.pixel_format and self.pix_fmt:
+            self.pixel_format = self.pix_fmt
 
 
 @dataclass
@@ -383,6 +390,7 @@ def probe_with_ffmpeg(file_path: Path, ffmpeg_exe: Path) -> MediaFileInfo:
         v = VideoStreamInfo()
         v.codec = v_match.group(1).lower()
         v.pixel_format = v_match.group(2)
+        v.pix_fmt = v_match.group(2)
         v.width = int(v_match.group(3))
         v.height = int(v_match.group(4))
         v.fps = float(v_match.group(5))
@@ -519,6 +527,7 @@ def probe_file(file_path: Path, ffprobe_exe: Optional[Path], ffmpeg_exe: Optiona
                 v.width = int(st.get("width", 0))
                 v.height = int(st.get("height", 0))
                 v.pixel_format = st.get("pix_fmt", "")
+                v.pix_fmt = st.get("pix_fmt", "")
 
                 # Parse FPS
                 r_fps = st.get("r_frame_rate", "") or st.get("avg_frame_rate", "")
@@ -2817,7 +2826,7 @@ class VideoJoiner:
                 and v_info.width == target_w
                 and v_info.height == target_h
                 and (abs((v_info.fps or 0) - target_fps) < 0.1 or target_fps <= 0)
-                and (v_info.pix_fmt or "yuv420p").lower() in ("yuv420p", "yuvj420p")
+                and (getattr(v_info, "pix_fmt", None) or getattr(v_info, "pixel_format", None) or "yuv420p").lower() in ("yuv420p", "yuvj420p")
             )
 
             if v_info and v_info.width == target_w and v_info.height == target_h and abs((v_info.fps or 0) - target_fps) < 0.05:

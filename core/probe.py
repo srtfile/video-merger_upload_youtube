@@ -34,8 +34,15 @@ class VideoStreamInfo:
     fps: float = 0.0
     fps_str: str = ""
     pix_fmt: str = ""
+    pixel_format: str = ""
     bitrate: int = 0
     duration: float = 0.0
+
+    def __post_init__(self):
+        if not self.pix_fmt and self.pixel_format:
+            self.pix_fmt = self.pixel_format
+        elif not self.pixel_format and self.pix_fmt:
+            self.pixel_format = self.pix_fmt
 
 @dataclass
 class AudioStreamInfo:
