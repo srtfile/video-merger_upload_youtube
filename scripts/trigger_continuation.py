@@ -22,7 +22,8 @@ def main():
     total_batches_raw = os.environ.get("TOTAL_BATCHES", "1").strip()
     output_filename = os.environ.get("OUTPUT_FILENAME", "merged_video.mp4").strip()
     join_mode = os.environ.get("JOIN_MODE", "auto").strip()
-    preset = os.environ.get("PRESET", "veryfast").strip()
+    preset = os.environ.get("PRESET", "ultrafast").strip()
+    crf = os.environ.get("CRF", "20").strip()
     sort_order = os.environ.get("SORT_ORDER", "natural").strip()
     max_runtime = os.environ.get("MAX_RUNTIME", "320").strip()
     upload_release = os.environ.get("UPLOAD_RELEASE", "false").strip().lower()
@@ -91,6 +92,7 @@ def main():
         "output_filename": output_filename,
         "join_mode": join_mode,
         "preset": preset,
+        "crf": crf,
         "sort_order": sort_order,
         "max_runtime": max_runtime,
         "upload_release": upload_release,
@@ -148,6 +150,7 @@ def main():
             "-f", f"output_filename={output_filename}",
             "-f", f"join_mode={join_mode}",
             "-f", f"preset={preset}",
+            "-f", f"crf={crf}",
             "-f", f"sort_order={sort_order}",
             "-f", f"max_runtime={max_runtime}",
             "-f", f"upload_release={upload_release}",
