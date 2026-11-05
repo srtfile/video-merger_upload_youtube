@@ -796,6 +796,56 @@ def find_cached_video(
     return None
 
 
+def load_gdrive_cookies(session: Optional[Any] = None) -> Optional[Path]:
+    """
+    Finds, prepares, and loads Google Drive cookies for bypassing download quotas:
+    1. If environment variable GDRIVE_COOKIES exists, writes it to 'cookies.txt'.
+    2. Searches for 'cookies.txt' in current dir or repo root.
+    3. If session is provided, populates session.cookies or sets Cookie header.
+    Returns Path to cookies file if valid, else None.
+    """
+    env_cookies = os.environ.get("GDRIVE_COOKIES", "").strip()
+    cookie_path = Path("cookies.txt")
+
+    if env_cookies and not cookie_path.exists():
+        try:
+            cookie_path.write_text(env_cookies, encoding="utf-8")
+            print("🍪 [Cookie Engine] Loaded GDRIVE_COOKIES from environment into cookies.txt")
+        except Exception as e:
+            print(f"⚠️ [Cookie Engine] Could not write cookies.txt: {e}")
+
+    if not cookie_path.exists():
+        for parent in Path.cwd().parents:
+            cand = parent / "cookies.txt"
+            if cand.exists():
+                cookie_path = cand
+                break
+
+    if not cookie_path.exists() or cookie_path.stat().st_size < 10:
+        return None
+
+    if session:
+        try:
+            import http.cookiejar
+            jar = http.cookiejar.MozillaCookieJar(str(cookie_path))
+            jar.load(ignore_discard=True, ignore_expires=True)
+            session.cookies.update(jar)
+            print(f"🍪 [Cookie Engine] Successfully injected cookies from '{cookie_path.name}' into HTTP session.")
+        except Exception:
+            try:
+                raw_text = cookie_path.read_text(encoding="utf-8", errors="ignore").strip()
+                if "SID=" in raw_text or "HSID=" in raw_text or "authuser=" in raw_text:
+                    for part in raw_text.split(";"):
+                        if "=" in part:
+                            k, v = part.strip().split("=", 1)
+                            session.cookies.set(k.strip(), v.strip(), domain=".google.com")
+                    print(f"🍪 [Cookie Engine] Injected raw key-value cookies from '{cookie_path.name}'.")
+            except Exception as e2:
+                print(f"⚠️ [Cookie Engine] Could not parse cookies.txt: {e2}")
+
+    return cookie_path if cookie_path.exists() else None
+
+
 def download_with_gdown(
     url_or_id: str,
     dest_dir: Path,
@@ -815,24 +865,29 @@ def download_with_gdown(
     
     # Destination ending in separator tells gdown to preserve remote filename in dest_dir
     dest_param = str(dest_dir.resolve()) + os.sep
+
+    cookie_file = load_gdrive_cookies()
+    g_kwargs = {"quiet": quiet}
+    if cookie_file:
+        g_kwargs["cookies"] = str(cookie_file)
     
     res = None
     err_notes = []
     try:
-        res = gdown.download(url=url, output=dest_param, quiet=quiet)
+        res = gdown.download(url=url, output=dest_param, **g_kwargs)
     except Exception as e:
         err_notes.append(str(e))
         
     if (not res or not Path(res).is_file()) and file_id:
         try:
-            res = gdown.download(id=file_id, output=dest_param, quiet=quiet)
+            res = gdown.download(id=file_id, output=dest_param, **g_kwargs)
         except Exception as e:
             err_notes.append(str(e))
             
     if not res or not Path(res).is_file():
         fallback_file = dest_dir / f"drive_video_{index:02d}.mp4"
         try:
-            res = gdown.download(url=url, output=str(fallback_file), quiet=quiet)
+            res = gdown.download(url=url, output=str(fallback_file), **g_kwargs)
         except Exception as e:
             err_notes.append(str(e))
         
@@ -939,6 +994,7 @@ def download_with_requests(
 
     session = requests.Session()
     session.trust_env = False  # Direct connection without proxy/VPN for Google Drive
+    load_gdrive_cookies(session)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
@@ -967,7 +1023,10 @@ def download_with_requests(
 
         # 2. Check for quota exceeded
         if "quota" in html_text.lower() or "too many users" in html_text.lower():
-            raise RuntimeError(f"Google Drive download quota exceeded for: {url_or_id}")
+            raise RuntimeError(
+                f"Google Drive download quota exceeded for: {url_or_id}\n"
+                f"👉 Fix: In Google Drive, right-click file -> 'Make a copy' -> Share copy as 'Anyone with link', or add your browser cookies to GitHub Secrets as GDRIVE_COOKIES."
+            )
 
         # 3. Check for Google Drive Virus Scan Warning form (for files > 100MB)
         form_inputs = {}
@@ -978,14 +1037,31 @@ def download_with_requests(
         action_url = action_match.group(1) if action_match else "https://drive.usercontent.google.com/download"
 
         if form_inputs and "confirm" in form_inputs:
+            form_inputs.setdefault("authuser", "0")
             response = session.get(action_url, params=form_inputs, headers=headers, stream=True, allow_redirects=True)
+            resp_ct = response.headers.get("content-type", "").lower()
+            if "text/html" in resp_ct:
+                html_text2 = next(response.iter_content(65536), b"").decode("utf-8", errors="replace")
+                if "quota" in html_text2.lower() or "too many users" in html_text2.lower():
+                    raise RuntimeError(
+                        f"Google Drive download quota exceeded for: {url_or_id}\n"
+                        f"👉 Fix: In Google Drive, right-click file -> 'Make a copy' -> Share copy as 'Anyone with link', or add your browser cookies to GitHub Secrets as GDRIVE_COOKIES."
+                    )
         else:
             # Fallback legacy token search
             m_token = re.search(r'confirm=([0-9A-Za-z_-]+)', html_text)
             if m_token and file_id:
                 token = m_token.group(1)
-                confirm_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm={token}"
+                confirm_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm={token}&authuser=0"
                 response = session.get(confirm_url, headers=headers, stream=True, allow_redirects=True)
+                resp_ct = response.headers.get("content-type", "").lower()
+                if "text/html" in resp_ct:
+                    html_text2 = next(response.iter_content(65536), b"").decode("utf-8", errors="replace")
+                    if "quota" in html_text2.lower() or "too many users" in html_text2.lower():
+                        raise RuntimeError(
+                            f"Google Drive download quota exceeded for: {url_or_id}\n"
+                            f"👉 Fix: In Google Drive, right-click file -> 'Make a copy' -> Share copy as 'Anyone with link', or add your browser cookies to GitHub Secrets as GDRIVE_COOKIES."
+                        )
             else:
                 raise RuntimeError(
                     f"Google Drive returned an HTML page instead of video data for: {url_or_id}\n"
@@ -1575,6 +1651,7 @@ def download_with_ytdlp(
         progress_callback(0, 100, f"Extracting stream via yt-dlp: {url_or_id}")
 
     out_tmpl = str(dest_dir / f"{index:02d} - %(title)s.%(ext)s")
+    cookie_file = load_gdrive_cookies()
     cmd = [
         sys.executable, "-m", "yt_dlp",
         "--no-check-certificates",
@@ -1582,9 +1659,10 @@ def download_with_ytdlp(
         "-f", "bv*+ba/b",
         "--merge-output-format", "mp4",
         "--no-warnings",
-        "-o", out_tmpl,
-        target_url
     ]
+    if cookie_file:
+        cmd.extend(["--cookies", str(cookie_file)])
+    cmd.extend(["-o", out_tmpl, target_url])
 
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=900)
