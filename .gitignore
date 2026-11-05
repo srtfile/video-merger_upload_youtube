@@ -1,0 +1,20 @@
+# Secrets and sensitive cookies
+cookies.txt
+token.json
+client_secrets.json
+service_account.json
+
+# Video processing caches & downloads
+.video_cache/
+downloads/
+temp/
+*.part
+*.ts.done
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+
