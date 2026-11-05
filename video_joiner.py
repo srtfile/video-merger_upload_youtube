@@ -2516,8 +2516,18 @@ class VideoJoiner:
                 clip_dur_str = format_duration(f.duration) if f.duration > 0 else "unknown"
                 print(f"\n🎬 Normalizing Clip [{i+1}/{n}]: {f.path.name} ({clip_dur_str})...")
 
-            # Preserve original resolution without re-scaling if clip already matches target dimensions
+            # Check if video stream matches target spec directly (lossless stream copy is 100x faster)
             v_info = f.video
+            can_copy_video = (
+                not is_partial_resume
+                and v_info is not None
+                and v_info.codec.lower() in ("h264", "avc", "avc1")
+                and v_info.width == target_w
+                and v_info.height == target_h
+                and (abs((v_info.fps or 0) - target_fps) < 0.1 or target_fps <= 0)
+                and (v_info.pix_fmt or "yuv420p").lower() in ("yuv420p", "yuvj420p")
+            )
+
             if v_info and v_info.width == target_w and v_info.height == target_h and abs((v_info.fps or 0) - target_fps) < 0.05:
                 clip_vf = "setsar=1"
             elif v_info and v_info.width == target_w and v_info.height == target_h:
@@ -2550,36 +2560,70 @@ class VideoJoiner:
                     "-err_detect", "ignore_err"
                 ]
 
-            if f.audio:
-                cmd = [
-                    str(self.ffmpeg_exe), "-y",
-                ] + resilient_input_opts + [
-                    "-i", str(f.path),
-                    "-threads", "0",
-                    "-vf", clip_vf,
-                    "-af", clip_af,
-                    "-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p",
-                    "-c:a", "aac", "-b:a", "192k", "-ar", str(target_sr), "-ac", "2",
-                    "-avoid_negative_ts", "make_zero",
-                    "-max_muxing_queue_size", "4096",
-                    "-bsf:v", "h264_mp4toannexb",
-                    str(target_seg_dest)
-                ]
+            if can_copy_video:
+                print(f"  ⚡ Video matches target spec ({target_w}x{target_h} @ {target_fps:.2f}fps, h264): using ultra-fast stream copy (-c:v copy)!")
+                if f.audio:
+                    cmd = [
+                        str(self.ffmpeg_exe), "-y",
+                    ] + resilient_input_opts + [
+                        "-i", str(f.path),
+                        "-threads", "0",
+                        "-c:v", "copy",
+                        "-bsf:v", "h264_mp4toannexb",
+                        "-af", clip_af,
+                        "-c:a", "aac", "-b:a", "192k", "-ar", str(target_sr), "-ac", "2",
+                        "-avoid_negative_ts", "make_zero",
+                        "-max_muxing_queue_size", "4096",
+                        str(target_seg_dest)
+                    ]
+                else:
+                    cmd = [
+                        str(self.ffmpeg_exe), "-y",
+                    ] + resilient_input_opts + [
+                        "-i", str(f.path),
+                        "-f", "lavfi", "-i", f"anullsrc=r={target_sr}:cl=stereo",
+                        "-threads", "0",
+                        "-c:v", "copy",
+                        "-bsf:v", "h264_mp4toannexb",
+                        "-c:a", "aac", "-b:a", "192k", "-shortest",
+                        "-avoid_negative_ts", "make_zero",
+                        "-max_muxing_queue_size", "4096",
+                        str(target_seg_dest)
+                    ]
             else:
-                cmd = [
-                    str(self.ffmpeg_exe), "-y",
-                ] + resilient_input_opts + [
-                    "-i", str(f.path),
-                    "-f", "lavfi", "-i", f"anullsrc=r={target_sr}:cl=stereo",
-                    "-threads", "0",
-                    "-vf", clip_vf,
-                    "-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p",
-                    "-c:a", "aac", "-b:a", "192k", "-shortest",
-                    "-avoid_negative_ts", "make_zero",
-                    "-max_muxing_queue_size", "4096",
-                    "-bsf:v", "h264_mp4toannexb",
-                    str(target_seg_dest)
-                ]
+                # Transcode with ultrafast preset, fastdecode tune, multi-threading
+                if f.audio:
+                    cmd = [
+                        str(self.ffmpeg_exe), "-y",
+                    ] + resilient_input_opts + [
+                        "-i", str(f.path),
+                        "-threads", "0",
+                        "-vf", clip_vf,
+                        "-af", clip_af,
+                        "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
+                        "-tune", "fastdecode", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", "192k", "-ar", str(target_sr), "-ac", "2",
+                        "-avoid_negative_ts", "make_zero",
+                        "-max_muxing_queue_size", "4096",
+                        "-bsf:v", "h264_mp4toannexb",
+                        str(target_seg_dest)
+                    ]
+                else:
+                    cmd = [
+                        str(self.ffmpeg_exe), "-y",
+                    ] + resilient_input_opts + [
+                        "-i", str(f.path),
+                        "-f", "lavfi", "-i", f"anullsrc=r={target_sr}:cl=stereo",
+                        "-threads", "0",
+                        "-vf", clip_vf,
+                        "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
+                        "-tune", "fastdecode", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", "192k", "-shortest",
+                        "-avoid_negative_ts", "make_zero",
+                        "-max_muxing_queue_size", "4096",
+                        "-bsf:v", "h264_mp4toannexb",
+                        str(target_seg_dest)
+                    ]
 
             rem_duration = max(1.0, f.duration - resume_offset) if is_partial_resume else f.duration
 
@@ -2611,6 +2655,44 @@ class VideoJoiner:
                 print(f"🔄 Setting resumed_needed=true for GitHub Actions auto-continuation.")
                 print(f"========================================================\n")
                 return False, f"TIME_BUDGET_REACHED ({i}/{n} clips done)", True, []
+
+            # If stream copy attempt failed, fall back to transcode
+            if can_copy_video and (not success or not target_seg_dest.is_file() or target_seg_dest.stat().st_size < 1024) and "TIME_BUDGET_REACHED" not in err:
+                print(f"  🔄 Stream copy could not mux cleanly; switching to transcode with preset={preset}...")
+                if f.audio:
+                    cmd = [
+                        str(self.ffmpeg_exe), "-y",
+                    ] + resilient_input_opts + [
+                        "-i", str(f.path),
+                        "-threads", "0",
+                        "-vf", clip_vf,
+                        "-af", clip_af,
+                        "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
+                        "-tune", "fastdecode", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", "192k", "-ar", str(target_sr), "-ac", "2",
+                        "-avoid_negative_ts", "make_zero",
+                        "-max_muxing_queue_size", "4096",
+                        "-bsf:v", "h264_mp4toannexb",
+                        str(target_seg_dest)
+                    ]
+                else:
+                    cmd = [
+                        str(self.ffmpeg_exe), "-y",
+                    ] + resilient_input_opts + [
+                        "-i", str(f.path),
+                        "-f", "lavfi", "-i", f"anullsrc=r={target_sr}:cl=stereo",
+                        "-threads", "0",
+                        "-vf", clip_vf,
+                        "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
+                        "-tune", "fastdecode", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", "192k", "-shortest",
+                        "-avoid_negative_ts", "make_zero",
+                        "-max_muxing_queue_size", "4096",
+                        "-bsf:v", "h264_mp4toannexb",
+                        str(target_seg_dest)
+                    ]
+                success, err = run_ffmpeg_with_progress(cmd, rem_duration, clip_progress, deadline_time=deadline_time)
+                print()
 
             # Multi-stage fault-tolerant fallback if primary attempt failed (e.g. fatal audio bitstream corruption)
             if not success or not target_seg_dest.is_file() or target_seg_dest.stat().st_size < 1024:
@@ -2669,7 +2751,8 @@ class VideoJoiner:
                     seg_path.unlink(missing_ok=True)
                 if done_file.exists():
                     done_file.unlink(missing_ok=True)
-                return False, f"Error normalizing clip [{i+1}/{n}] {f.path.name}: {err}", False, []
+                print(f"⚠️ Clip [{i+1}/{n}] '{f.path.name}' failed to normalize. Checkpoint for {i}/{n} completed clips is preserved.")
+                return False, f"Error normalizing clip [{i+1}/{n}] {f.path.name}: {err}", True, []
 
             # Mark segment as successfully completed
             try:
@@ -2683,6 +2766,13 @@ class VideoJoiner:
                 }
                 with open(manifest_path, "w", encoding="utf-8") as mf:
                     json.dump(manifest_data, mf, indent=2)
+            except Exception:
+                pass
+
+            # Free up runner disk space immediately by deleting raw downloaded file if in downloads
+            try:
+                if f.path.is_file() and "downloads" in str(f.path.resolve()).lower():
+                    f.path.unlink(missing_ok=True)
             except Exception:
                 pass
 
@@ -3120,8 +3210,8 @@ def main():
     parser.add_argument("--batch-index", type=int, default=None, help="1-based index of specific batch to process from links file (e.g. 1 for first batch).")
     parser.add_argument("--batch-delay", type=int, default=300, help="Cooldown delay in seconds between batch items (default: 300 / 5 minutes).")
     parser.add_argument("-m", "--mode", choices=["auto", "copy", "transcode"], default="auto", help="Join mode.")
-    parser.add_argument("--crf", type=int, default=17, help="Transcode CRF.")
-    parser.add_argument("--preset", default="veryfast", choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"], help="x264 transcode speed preset (default: veryfast).")
+    parser.add_argument("--crf", type=int, default=20, help="Transcode CRF (default: 20 for visually lossless quality & 2x speed).")
+    parser.add_argument("--preset", default="ultrafast", choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"], help="x264 transcode speed preset (default: ultrafast for maximum GitHub speed).")
     parser.add_argument("--cache-dir", default=None, help="Segment cache directory for resumable processing.")
     parser.add_argument("--max-runtime", type=int, default=320, help="Maximum execution runtime in minutes before saving checkpoint (default: 320 / 5 hours 20 minutes).")
     parser.add_argument("--sort", choices=["natural", "alphabetical", "date", "size", "none"], default="natural", help="Sort order.")
