@@ -326,6 +326,7 @@ jobs:
           echo "✅ Installed Google Drive cookies into cookies.txt for authenticated quota bypass."
         env:
           GDRIVE_COOKIES: ${{ secrets.GDRIVE_COOKIES }}
+          GDRIVE_TOKEN_JSON: ${{ secrets.GDRIVE_TOKEN_JSON }}
 
       - name: "🚀 Download & Merge Losslessly (Batch ${{ matrix.batch.index }} - ${{ matrix.batch.name }})"
         id: merge_step
@@ -340,6 +341,7 @@ jobs:
           MAX_RUNTIME: ${{ inputs.max_runtime || 320 }}
           CI: 'true'
           GDRIVE_COOKIES: ${{ secrets.GDRIVE_COOKIES }}
+          GDRIVE_TOKEN_JSON: ${{ secrets.GDRIVE_TOKEN_JSON }}
         run: |
           echo "========================================================"
           echo "🎬 Processing Batch ${{ matrix.batch.index }}: ${{ matrix.batch.name }}"

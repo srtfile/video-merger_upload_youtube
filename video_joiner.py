@@ -2149,6 +2149,110 @@ def download_with_ytdlp(url_or_id: str, dest_dir: Path, index: int = 1) -> Path:
     raise RuntimeError(f"yt-dlp could not extract stream for {url_or_id}: {err_snip}")
 
 
+def download_with_gdrive_api_copy(url_or_id: str, dest_dir: Path, index: int = 1) -> Optional[Path]:
+    """
+    Automatic Google Drive Quota-Bypass Engine:
+    When standard downloads hit 'Quota Exceeded', this engine:
+    1. Authenticates using GDRIVE_TOKEN_JSON from env or gdrive_token.json on disk.
+    2. Duplicates the quota-locked file into the user's Google Drive via Drive API v3.
+       (Google assigns a fresh File ID with an empty quota counter).
+    3. Streams the fresh copy directly to disk.
+    4. Automatically deletes the temporary copy from Google Drive to keep storage clean.
+    """
+    file_id = extract_gdrive_id(url_or_id)
+    if not file_id:
+        return None
+
+    raw_token = os.environ.get("GDRIVE_TOKEN_JSON", "").strip()
+    token_file = Path("gdrive_token.json")
+    token_data = None
+
+    if raw_token:
+        try:
+            token_data = json.loads(raw_token)
+        except Exception:
+            pass
+
+    if not token_data and token_file.exists():
+        try:
+            token_data = json.loads(token_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    if not token_data or not token_data.get("refresh_token"):
+        return None
+
+    print(f"✨ [Auto-Bypass Engine] Bypassing Google Drive quota limit for '{file_id}' via Google Drive API copy...")
+    try:
+        refresh_token = token_data.get("refresh_token")
+        client_id = token_data.get("client_id")
+        client_secret = token_data.get("client_secret")
+
+        resp = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            print(f"⚠️ [Auto-Bypass Engine] Token refresh failed: {resp.text}")
+            return None
+
+        access_token = resp.json().get("access_token")
+        headers = {"Authorization": f"Bearer {access_token}"}
+
+        # 1. Fetch original file metadata
+        meta_res = requests.get(
+            f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=name,size",
+            headers=headers,
+            timeout=20
+        )
+        orig_name = meta_res.json().get("name", f"video_{index:02d}.mp4") if meta_res.status_code == 200 else f"video_{index:02d}.mp4"
+
+        # 2. Make fresh copy in user's Drive
+        copy_res = requests.post(
+            f"https://www.googleapis.com/drive/v3/files/{file_id}/copy?fields=id,name",
+            headers=headers,
+            json={"name": f"temp_{index}_{orig_name}"},
+            timeout=35
+        )
+        if copy_res.status_code != 200:
+            print(f"⚠️ [Auto-Bypass Engine] Copy failed ({copy_res.status_code}): {copy_res.text}")
+            return None
+
+        new_id = copy_res.json()["id"]
+        print(f"📋 [Auto-Bypass Engine] Created temporary fresh copy: {new_id}")
+
+        dest_file = dest_dir / f"{index:02d} - {orig_name}"
+        dl_url = f"https://www.googleapis.com/drive/v3/files/{new_id}?alt=media"
+
+        try:
+            with requests.get(dl_url, headers=headers, stream=True, timeout=90) as dl_resp:
+                dl_resp.raise_for_status()
+                with open(dest_file, "wb") as f_out:
+                    for chunk in dl_resp.iter_content(chunk_size=2 * 1024 * 1024):
+                        if chunk:
+                            f_out.write(chunk)
+            final_file = ensure_video_extension(dest_file.resolve())
+            print(f"✅ [Auto-Bypass Engine] Successfully retrieved '{final_file.name}' ({format_size(final_file.stat().st_size)})!")
+            return final_file
+        finally:
+            # 3. Clean up temporary copy
+            try:
+                requests.delete(f"https://www.googleapis.com/drive/v3/files/{new_id}", headers=headers, timeout=15)
+                print(f"🧹 [Auto-Bypass Engine] Deleted temporary copy {new_id} from your Google Drive.")
+            except Exception:
+                pass
+
+    except Exception as e:
+        print(f"⚠️ [Auto-Bypass Engine Error]: {e}")
+        return None
+
+
 def download_video(url_or_id: str, dest_dir: Path, index: int = 1) -> Path:
     """Download a video using gdown, requests, or yt-dlp fallback (with quota bypass) and convert .ts to .mp4."""
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -2197,10 +2301,19 @@ def download_video(url_or_id: str, dest_dir: Path, index: int = 1) -> Path:
         try:
             res_path = download_with_ytdlp(url_or_id, dest_dir, index=index)
         except Exception as yt_err:
-            print(f"❌ All download engines failed for {url_or_id}: {yt_err}")
-            if last_err:
-                raise last_err
-            raise yt_err
+            last_err = yt_err
+            # 6. Automatic Google Drive API Copy Bypass
+            if file_id:
+                try:
+                    res_path = download_with_gdrive_api_copy(url_or_id, dest_dir, index=index)
+                except Exception as api_err:
+                    print(f"⚠️ [Auto-Bypass API Note]: {api_err}")
+
+            if not res_path or not res_path.is_file():
+                print(f"❌ All download engines failed for {url_or_id}: {yt_err}")
+                if last_err:
+                    raise last_err
+                raise yt_err
 
     if res_path and res_path.is_file():
         if is_ts_file(res_path):

@@ -1,8 +1,10 @@
 # Secrets and sensitive cookies
 cookies.txt
 token.json
+gdrive_token.json
 client_secrets.json
 service_account.json
+*.bak
 
 # Video processing caches & downloads
 .video_cache/
