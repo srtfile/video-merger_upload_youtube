@@ -37,6 +37,33 @@ _ENC = (
 )
 
 def get_oauth_client():
+    # 1. Check local client_secrets.json
+    for path in [Path("client_secrets.json"), Path("credentials.json")]:
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                cfg = data.get("installed") or data.get("web") or data
+                cid = cfg.get("client_id")
+                csec = cfg.get("client_secret")
+                if cid and csec:
+                    return cid, csec
+            except Exception:
+                pass
+
+    # 2. Check environment variables
+    env_cid = os.environ.get("GDRIVE_CLIENT_ID")
+    env_csec = os.environ.get("GDRIVE_CLIENT_SECRET")
+    if env_cid and env_csec:
+        return env_cid, env_csec
+
+    # 3. Check obfuscated embedded client credentials
+    try:
+        from core.downloader import HARDCODED_GDRIVE_TOKEN
+        if isinstance(HARDCODED_GDRIVE_TOKEN, dict):
+            return HARDCODED_GDRIVE_TOKEN.get("client_id"), HARDCODED_GDRIVE_TOKEN.get("client_secret")
+    except Exception:
+        pass
+
     try:
         raw = base64.b64decode(_ENC)
         data = json.loads(bytes([b ^ 0x5A for b in raw]).decode("utf-8"))
@@ -270,3 +297,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
