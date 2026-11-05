@@ -217,6 +217,13 @@ class VideoStreamInfo:
         elif not self.pixel_format and self.pix_fmt:
             self.pixel_format = self.pix_fmt
 
+    def __getattr__(self, name):
+        if name == "pix_fmt":
+            return self.__dict__.get("pix_fmt") or self.__dict__.get("pixel_format", "")
+        if name == "pixel_format":
+            return self.__dict__.get("pixel_format") or self.__dict__.get("pix_fmt", "")
+        raise AttributeError(f"'VideoStreamInfo' object has no attribute '{name}'")
+
 
 @dataclass
 class AudioStreamInfo:
