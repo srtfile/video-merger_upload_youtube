@@ -53,6 +53,11 @@ try:
 except ImportError:
     tqdm = None
 
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
+
 
 def extract_gdrive_id(url: str) -> Optional[str]:
     """
@@ -1550,6 +1555,66 @@ def download_webpage_video(
 
 
 
+def download_with_ytdlp(
+    url_or_id: str,
+    dest_dir: Path,
+    index: int = 1,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None
+) -> Path:
+    """
+    Download Google Drive or streaming video via yt-dlp.
+    Bypasses Google Drive 'Quota exceeded' / 'Too many users have viewed or downloaded this file' restrictions
+    by pulling the media stream directly from Google's video playback infrastructure.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    file_id = extract_gdrive_id(url_or_id)
+    target_url = f"https://drive.google.com/file/d/{file_id}/view" if file_id else url_or_id
+
+    print(f"🌐 [yt-dlp Engine] Extracting stream for '{target_url}' (Bypassing Google Drive quota lock)...")
+    if progress_callback:
+        progress_callback(0, 100, f"Extracting stream via yt-dlp: {url_or_id}")
+
+    out_tmpl = str(dest_dir / f"{index:02d} - %(title)s.%(ext)s")
+    cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "--no-check-certificates",
+        "--no-playlist",
+        "-f", "bv*+ba/b",
+        "--merge-output-format", "mp4",
+        "--no-warnings",
+        "-o", out_tmpl,
+        target_url
+    ]
+
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=900)
+    except Exception as e:
+        raise RuntimeError(f"yt-dlp execution error: {e}")
+
+    # Find the downloaded file starting with our index prefix
+    prefix = f"{index:02d} - "
+    candidates = [p for p in dest_dir.iterdir() if p.is_file() and p.name.startswith(prefix) and not p.name.endswith(".part") and p.stat().st_size > 1024]
+    if candidates:
+        candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        res_file = candidates[0]
+        # Clean double extensions like .mp4.mp4 if present
+        if res_file.name.lower().endswith(".mp4.mp4"):
+            cleaned_name = res_file.name[:-4]
+            cleaned_path = res_file.parent / cleaned_name
+            if cleaned_path.exists():
+                cleaned_path.unlink()
+            res_file = res_file.rename(cleaned_path)
+        final_file = ensure_video_extension(res_file.resolve())
+        print(f"✅ [yt-dlp Engine] Successfully retrieved '{final_file.name}' ({format_size(final_file.stat().st_size)})!")
+        if progress_callback:
+            sz = final_file.stat().st_size
+            progress_callback(sz, sz, final_file.name)
+        return final_file
+
+    err_snip = proc.stderr.strip()[:300] if proc.stderr else proc.stdout.strip()[:300]
+    raise RuntimeError(f"yt-dlp could not extract stream for {url_or_id}: {err_snip}")
+
+
 def download_video(
     url_or_id: str,
     dest_dir: Path,
@@ -1605,17 +1670,32 @@ def download_video(
             print(f"⚠️ gdown attempt note: {e}, falling back to requests session...")
             
     # 4. Fallback direct requests
-    try:
-        res_path = download_with_requests(
-            url_or_id=url_or_id,
-            dest_dir=dest_dir,
-            index=index,
-            progress_callback=progress_callback
-        )
-    except Exception as req_err:
-        if last_err and isinstance(req_err, PermissionError):
-            raise req_err
-        raise req_err
+    if not res_path or not res_path.is_file():
+        try:
+            res_path = download_with_requests(
+                url_or_id=url_or_id,
+                dest_dir=dest_dir,
+                index=index,
+                progress_callback=progress_callback
+            )
+        except Exception as req_err:
+            last_err = req_err
+            print(f"⚠️ Direct download attempt note: {req_err}, activating yt-dlp quota bypass engine...")
+
+    # 5. Bulletproof Quota Bypass Fallback via yt-dlp
+    if not res_path or not res_path.is_file():
+        try:
+            res_path = download_with_ytdlp(
+                url_or_id=url_or_id,
+                dest_dir=dest_dir,
+                index=index,
+                progress_callback=progress_callback
+            )
+        except Exception as yt_err:
+            print(f"❌ All download engines failed for {url_or_id}: {yt_err}")
+            if last_err:
+                raise last_err
+            raise yt_err
 
     if res_path and res_path.is_file():
         if is_ts_file(res_path):
@@ -1646,6 +1726,10 @@ def download_all_videos(
     total_count = len(urls)
 
     for i, url in enumerate(urls, start=1):
+        clean_u = url.strip().strip('"\'`,;<>').strip()
+        if not clean_u:
+            continue
+
         if max_runtime_minutes and job_start_time:
             elapsed_mins = (time.time() - job_start_time) / 60.0
             if elapsed_mins >= max_runtime_minutes:
@@ -1658,14 +1742,14 @@ def download_all_videos(
                 final_list = [convert_ts_to_mp4(p) if is_ts_file(p) else p for p in downloaded_files]
                 return final_list, True
 
-        if is_gdrive_folder(url):
+        if is_gdrive_folder(clean_u):
             if overall_callback:
                 overall_callback(i, total_count, f"Downloading Google Drive folder [{i}/{total_count}]...")
             try:
-                folder_vids = download_gdrive_folder(url, dest_dir=dest_dir)
+                folder_vids = download_gdrive_folder(clean_u, dest_dir=dest_dir)
                 downloaded_files.extend(folder_vids)
             except Exception as e:
-                failed_downloads.append((url, str(e)))
+                failed_downloads.append((clean_u, str(e)))
         else:
             if overall_callback:
                 overall_callback(i, total_count, f"Starting download {i}/{total_count}...")
@@ -1677,7 +1761,7 @@ def download_all_videos(
             try:
                 # Use deterministic 1-based index 'i' matching URL position
                 p = download_video(
-                    url_or_id=url,
+                    url_or_id=clean_u,
                     dest_dir=dest_dir,
                     index=i,
                     progress_callback=item_progress
@@ -1686,15 +1770,19 @@ def download_all_videos(
                     downloaded_files.append(p)
             except Exception as e:
                 print(f"❌ Error downloading [{i}/{total_count}]: {e}")
-                failed_downloads.append((url, str(e)))
+                failed_downloads.append((clean_u, str(e)))
 
     if failed_downloads:
         print("\n" + "=" * 62)
-        print("❌ DOWNLOAD ERRORS DETECTED:")
+        print("⚠️ DOWNLOAD ISSUES DETECTED:")
         for u, err in failed_downloads:
             print(f"  • {u}\n    {err}")
         print("=" * 62 + "\n")
-        raise RuntimeError(f"{len(failed_downloads)} download(s) failed. See error details above.")
+        if len(downloaded_files) >= 2:
+            print(f"⚠️ Warning: {len(failed_downloads)} of {total_count} clip(s) could not be downloaded.")
+            print(f"   Proceeding to merge the remaining {len(downloaded_files)} valid videos...")
+        else:
+            raise RuntimeError(f"{len(failed_downloads)} download(s) failed and fewer than 2 videos were retrieved.")
 
     final_list = []
     for p in downloaded_files:
