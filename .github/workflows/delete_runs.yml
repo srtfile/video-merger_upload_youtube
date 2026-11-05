@@ -1,0 +1,51 @@
+name: 🧹 Clean Workflow Runs History
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  delete-runs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🗑️ Delete All Past Workflow Runs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "🔍 Searching for workflow runs in $REPO..."
+          CURRENT_RUN="${{ github.run_id }}"
+          DELETED_COUNT=0
+          
+          while true; do
+            RUNS=$(gh run list -R "$REPO" --limit 100 --json databaseId -q ".[].databaseId")
+            
+            # Filter out the currently executing run ID
+            FILTERED_RUNS=""
+            for ID in $RUNS; do
+              if [ "$ID" != "$CURRENT_RUN" ]; then
+                FILTERED_RUNS="$FILTERED_RUNS $ID"
+              fi
+            done
+            
+            # Trim whitespace
+            FILTERED_RUNS=$(echo "$FILTERED_RUNS" | xargs)
+            
+            if [ -z "$FILTERED_RUNS" ]; then
+              echo "✅ No more historical workflow runs found."
+              break
+            fi
+            
+            for ID in $FILTERED_RUNS; do
+              echo "  🗑️ Deleting run #$ID..."
+              gh run delete "$ID" -R "$REPO" || true
+              DELETED_COUNT=$((DELETED_COUNT + 1))
+            done
+            
+            sleep 2
+          done
+          
+          echo "🎉 Successfully cleaned up $DELETED_COUNT workflow run(s) from $REPO!"
