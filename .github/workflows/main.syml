@@ -318,6 +318,15 @@ jobs:
             echo "ℹ️ No previous checkpoint artifact found. Fresh run will begin."
           fi
 
+      - name: 🍪 Setup Google Drive Cookies (Quota Bypass)
+        if: ${{ env.GDRIVE_COOKIES != '' }}
+        shell: bash
+        run: |
+          echo "$GDRIVE_COOKIES" > cookies.txt
+          echo "✅ Installed Google Drive cookies into cookies.txt for authenticated quota bypass."
+        env:
+          GDRIVE_COOKIES: ${{ secrets.GDRIVE_COOKIES }}
+
       - name: "🚀 Download & Merge Losslessly (Batch ${{ matrix.batch.index }} - ${{ matrix.batch.name }})"
         id: merge_step
         env:
@@ -330,6 +339,7 @@ jobs:
           CRF: ${{ inputs.crf || 20 }}
           MAX_RUNTIME: ${{ inputs.max_runtime || 320 }}
           CI: 'true'
+          GDRIVE_COOKIES: ${{ secrets.GDRIVE_COOKIES }}
         run: |
           echo "========================================================"
           echo "🎬 Processing Batch ${{ matrix.batch.index }}: ${{ matrix.batch.name }}"
