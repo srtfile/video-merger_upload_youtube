@@ -824,6 +824,14 @@ def load_gdrive_cookies(session: Optional[Any] = None) -> Optional[Path]:
     if not cookie_path.exists() or cookie_path.stat().st_size < 10:
         return None
 
+    try:
+        gdown_cache = Path.home() / ".cache" / "gdown"
+        gdown_cache.mkdir(parents=True, exist_ok=True)
+        import shutil
+        shutil.copy2(cookie_path, gdown_cache / "cookies.txt")
+    except Exception:
+        pass
+
     if session:
         try:
             import http.cookiejar
@@ -869,7 +877,7 @@ def download_with_gdown(
     cookie_file = load_gdrive_cookies()
     g_kwargs = {"quiet": quiet}
     if cookie_file:
-        g_kwargs["cookies"] = str(cookie_file)
+        g_kwargs["use_cookies"] = True
     
     res = None
     err_notes = []
