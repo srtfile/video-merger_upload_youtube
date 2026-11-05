@@ -45,6 +45,11 @@ try:
 except ImportError:
     tqdm = None
 
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
+
 
 # =====================================================================
 # 1. FILE FILTERING & NATURAL SORTING
@@ -607,21 +612,21 @@ def analyze_compatibility(files: List[MediaFileInfo]) -> CompatibilityAnalysis:
 
 def extract_gdrive_id(url: str) -> Optional[str]:
     """Extract file/folder ID from Google Drive URLs."""
-    url = url.strip()
+    url = url.strip().strip('"\'`,;<>').strip()
     m = re.search(r"(?:/file/d/|/d/|/folders/)([a-zA-Z0-9_-]{25,})", url)
     if m:
-        return m.group(1)
+        return m.group(1).rstrip(",;")
     m = re.search(r"[?&]id=([a-zA-Z0-9_-]{25,})", url)
     if m:
-        return m.group(1)
+        return m.group(1).rstrip(",;")
     if re.match(r"^[a-zA-Z0-9_-]{25,}$", url):
-        return url
+        return url.rstrip(",;")
     return None
 
 
 def is_gdrive_folder(url: str) -> bool:
     """Check if URL points to a Google Drive folder."""
-    return bool(re.search(r"(?:/drive/(?:u/\d+/)?folders/|/folders/)", url.strip()))
+    return bool(re.search(r"(?:/drive/(?:u/\d+/)?folders/|/folders/)", url.strip().strip('"\'`,;<>').strip()))
 
 
 def extract_urls_from_text(text: str) -> List[str]:
@@ -629,18 +634,18 @@ def extract_urls_from_text(text: str) -> List[str]:
     if not text:
         return []
     urls: List[str] = []
-    normalized = text.replace(",", "\n").replace(";", "\n")
+    normalized = text.replace(";", "\n")
     for raw_line in normalized.splitlines():
-        line = raw_line.strip().strip('"').strip("'").strip()
+        line = raw_line.strip().strip('"').strip("'").rstrip(",")
         if not line or line.startswith("#") or line.startswith("//"):
             continue
         for token in line.split():
-            token = token.strip().strip('"').strip("'").strip()
-            if not token:
+            clean_token = token.strip().strip('"\'`,;<>').strip()
+            if not clean_token:
                 continue
-            if token.startswith("http://") or token.startswith("https://") or extract_gdrive_id(token):
-                if token not in urls:
-                    urls.append(token)
+            if clean_token.startswith("http://") or clean_token.startswith("https://") or extract_gdrive_id(clean_token):
+                if clean_token not in urls:
+                    urls.append(clean_token)
     return urls
 
 
@@ -708,7 +713,7 @@ def parse_batch_groups(file_path_or_content: Union[str, Path]) -> List[BatchGrou
         extracted = []
         tokens = line.split()
         for token in tokens:
-            t = token.strip().strip('"').strip("'").strip()
+            t = token.strip().strip('"\'`,;<>').strip()
             if is_link(t):
                 extracted.append(t)
 
@@ -2008,8 +2013,58 @@ def download_webpage_video(page_url: str, dest_dir: Path, index: int = 1) -> Pat
 
 
 
+def download_with_ytdlp(url_or_id: str, dest_dir: Path, index: int = 1) -> Path:
+    """
+    Download Google Drive or streaming video via yt-dlp.
+    Bypasses Google Drive 'Quota exceeded' / 'Too many users have viewed or downloaded this file' restrictions
+    by pulling the media stream directly from Google's video playback infrastructure.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    file_id = extract_gdrive_id(url_or_id)
+    target_url = f"https://drive.google.com/file/d/{file_id}/view" if file_id else url_or_id
+
+    print(f"🌐 [yt-dlp Engine] Extracting stream for '{target_url}' (Bypassing Google Drive quota lock)...")
+
+    out_tmpl = str(dest_dir / f"{index:02d} - %(title)s.%(ext)s")
+    cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "--no-check-certificates",
+        "--no-playlist",
+        "-f", "bv*+ba/b",
+        "--merge-output-format", "mp4",
+        "--no-warnings",
+        "-o", out_tmpl,
+        target_url
+    ]
+
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=900)
+    except Exception as e:
+        raise RuntimeError(f"yt-dlp execution error: {e}")
+
+    # Find the downloaded file starting with our index prefix
+    prefix = f"{index:02d} - "
+    candidates = [p for p in dest_dir.iterdir() if p.is_file() and p.name.startswith(prefix) and not p.name.endswith(".part") and p.stat().st_size > 1024]
+    if candidates:
+        candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        res_file = candidates[0]
+        # Clean double extensions like .mp4.mp4 if present
+        if res_file.name.lower().endswith(".mp4.mp4"):
+            cleaned_name = res_file.name[:-4]
+            cleaned_path = res_file.parent / cleaned_name
+            if cleaned_path.exists():
+                cleaned_path.unlink()
+            res_file = res_file.rename(cleaned_path)
+        final_file = ensure_video_extension(res_file.resolve())
+        print(f"✅ [yt-dlp Engine] Successfully retrieved '{final_file.name}' ({format_size(final_file.stat().st_size)})!")
+        return final_file
+
+    err_snip = proc.stderr.strip()[:300] if proc.stderr else proc.stdout.strip()[:300]
+    raise RuntimeError(f"yt-dlp could not extract stream for {url_or_id}: {err_snip}")
+
+
 def download_video(url_or_id: str, dest_dir: Path, index: int = 1) -> Path:
-    """Download a video using gdown with requests fallback and convert .ts to .mp4, with caching."""
+    """Download a video using gdown, requests, or yt-dlp fallback (with quota bypass) and convert .ts to .mp4."""
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Check download cache first before any network requests
@@ -2034,22 +2089,32 @@ def download_video(url_or_id: str, dest_dir: Path, index: int = 1) -> Path:
     file_id = extract_gdrive_id(url_or_id)
     last_err: Optional[Exception] = None
     res_path = None
+
+    # 3. Google Drive via gdown (fastest direct retrieval)
     if gdown and file_id:
         try:
             res_path = download_with_gdown(url_or_id, dest_dir, index=index)
-        except PermissionError:
-            raise
         except Exception as e:
             last_err = e
-            print(f"⚠️ gdown attempt note: {e}, falling back to requests session...")
+            print(f"⚠️ gdown attempt note: {e}, attempting direct requests session...")
 
+    # 4. Fallback direct requests stream
     if not res_path or not res_path.is_file():
         try:
             res_path = download_with_requests(url_or_id, dest_dir, index=index)
         except Exception as req_err:
-            if last_err and isinstance(req_err, PermissionError):
-                raise req_err
-            raise req_err
+            last_err = req_err
+            print(f"⚠️ Direct download attempt note: {req_err}, activating yt-dlp quota bypass engine...")
+
+    # 5. Bulletproof Quota Bypass Fallback via yt-dlp
+    if not res_path or not res_path.is_file():
+        try:
+            res_path = download_with_ytdlp(url_or_id, dest_dir, index=index)
+        except Exception as yt_err:
+            print(f"❌ All download engines failed for {url_or_id}: {yt_err}")
+            if last_err:
+                raise last_err
+            raise yt_err
 
     if res_path and res_path.is_file():
         if is_ts_file(res_path):
@@ -2075,6 +2140,11 @@ def download_all_videos(
     failed_downloads = []
     total = len(urls)
     for i, u in enumerate(urls, start=1):
+        # Clean URL token of any trailing commas, semicolons, quotes
+        clean_u = u.strip().strip('"\'`,;<>').strip()
+        if not clean_u:
+            continue
+
         # Check safety time budget before starting next download
         if max_runtime_minutes and job_start_time:
             elapsed_mins = (time.time() - job_start_time) / 60.0
@@ -2088,29 +2158,33 @@ def download_all_videos(
                 final_list = [convert_ts_to_mp4(p) if is_ts_file(p) else p for p in downloaded]
                 return final_list, True
 
-        if is_gdrive_folder(u):
+        if is_gdrive_folder(clean_u):
             try:
-                folder_vids = download_gdrive_folder(u, dest_dir)
+                folder_vids = download_gdrive_folder(clean_u, dest_dir)
                 downloaded.extend(folder_vids)
             except Exception as e:
-                failed_downloads.append((u, str(e)))
+                failed_downloads.append((clean_u, str(e)))
         else:
             try:
                 # Deterministic index matching URL position in list (1-based)
-                p = download_video(u, dest_dir, index=i)
+                p = download_video(clean_u, dest_dir, index=i)
                 if p and p.is_file() and p not in downloaded:
                     downloaded.append(p)
             except Exception as e:
                 print(f"❌ Error downloading [{i}/{total}]: {e}")
-                failed_downloads.append((u, str(e)))
+                failed_downloads.append((clean_u, str(e)))
 
     if failed_downloads:
         print("\n" + "=" * 62)
-        print("❌ DOWNLOAD ERRORS DETECTED:")
+        print("⚠️ DOWNLOAD ISSUES DETECTED:")
         for u, err in failed_downloads:
             print(f"  • {u}\n    {err}")
         print("=" * 62 + "\n")
-        raise RuntimeError(f"{len(failed_downloads)} download(s) failed. See error details above.")
+        if len(downloaded) >= 2:
+            print(f"⚠️ Warning: {len(failed_downloads)} of {total} clip(s) could not be downloaded.")
+            print(f"   Proceeding to merge the remaining {len(downloaded)} valid videos...")
+        else:
+            raise RuntimeError(f"{len(failed_downloads)} download(s) failed and fewer than 2 videos were retrieved.")
 
     final_list = []
     for p in downloaded:
