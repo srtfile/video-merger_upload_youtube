@@ -435,8 +435,16 @@ class VideoJoiner:
         n = len(files)
         target_w = analysis.target_width or 1920
         target_h = analysis.target_height or 1080
-        target_fps = analysis.target_fps if analysis.target_fps > 0 else 30.0
+        if target_w >= target_h and (target_w > 1920 or target_h > 1080):
+            target_w, target_h = 1920, 1080
+        elif target_h > target_w and (target_w > 1080 or target_h > 1920):
+            target_w, target_h = 1080, 1920
+        target_fps = min(30.0, analysis.target_fps if analysis.target_fps > 0 else 30.0)
         target_sr = analysis.target_audio_sample_rate or 48000
+        out_ext = output_path.suffix.lower()
+        enc_preset = "superfast" if preset == "ultrafast" else preset
+        enc_crf = max(crf, 22)
+        rate_limit_opts = ["-maxrate", "4500k", "-bufsize", "9000k"]
         deadline_time = (job_start_time + (max_runtime_minutes * 60.0)) if (max_runtime_minutes and job_start_time) else None
 
         ts_segments: List[Path] = []
@@ -445,7 +453,7 @@ class VideoJoiner:
 
         print(f"\n🧩 Segment-by-Segment Resumable Normalization Engine")
         print(f"   Target Spec:   {target_w}x{target_h} @ {target_fps:.2f} fps, {target_sr} Hz Audio")
-        print(f"   Transcode:     libx264, preset={preset}, crf={crf}")
+        print(f"   Transcode:     libx264, preset={enc_preset}, crf={enc_crf}, maxrate=4500k")
         print(f"   Cache Folder:  {cache_dir}")
         print(f"   Total Clips:   {n}")
         if max_runtime_minutes:
@@ -481,10 +489,13 @@ class VideoJoiner:
             is_valid_segment = False
             partial_dur = 0.0
             if seg_path.is_file() and seg_path.stat().st_size > 1024:
-                if done_file.is_file() or (seg_key in manifest_data and manifest_data[seg_key].get("done")):
+                seg_probe = probe_file(seg_path, self.ffprobe_exe, self.ffmpeg_exe)
+                if seg_probe and seg_probe.video and (seg_probe.video.width != target_w or seg_probe.video.height != target_h):
+                    seg_path.unlink(missing_ok=True)
+                    done_file.unlink(missing_ok=True)
+                elif done_file.is_file() or (seg_key in manifest_data and manifest_data[seg_key].get("done")):
                     is_valid_segment = True
                 else:
-                    seg_probe = probe_file(seg_path, self.ffprobe_exe, self.ffmpeg_exe)
                     if seg_probe and not seg_probe.error and seg_probe.video:
                         if f.duration > 0:
                             if seg_probe.duration > 0 and seg_probe.duration >= f.duration - 2.0:
@@ -506,6 +517,11 @@ class VideoJoiner:
                 cur_pct = ((i + 1) / n) * 100.0
                 sys.stdout.write(f"\r  [{'█'*int(30*(cur_pct/100.0)):<30}] {cur_pct:5.1f}% | ⏩ [Resume {i+1}/{n}] '{f.path.name}' already normalized. Skipping.\n")
                 sys.stdout.flush()
+                try:
+                    if f.path.is_file() and f.path.resolve() != seg_path.resolve() and "downloads" in str(f.path.resolve()).lower():
+                        f.path.unlink(missing_ok=True)
+                except Exception:
+                    pass
                 continue
 
             # Check if we can do partial resumption for an interrupted clip
@@ -816,6 +832,13 @@ class VideoJoiner:
 
         if not success or not output_path.is_file():
             return False, f"Failed lossless concat of segments: {err}", False
+
+        for s in ts_segments:
+            try:
+                if s.is_file():
+                    s.unlink(missing_ok=True)
+            except Exception:
+                pass
 
         return True, "", False
 

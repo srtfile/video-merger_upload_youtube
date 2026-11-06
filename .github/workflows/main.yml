@@ -218,7 +218,40 @@ jobs:
           echo "========================================================"
           echo "🧹 Freeing runner disk space for large video files..."
           df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo systemctl stop docker docker.socket containerd 2>/dev/null || true
+          sudo swapoff -a 2>/dev/null || true
+          sudo rm -rf \
+            /var/lib/docker \
+            /var/lib/containerd \
+            /mnt/swapfile \
+            /swapfile \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /usr/local/aws-cli \
+            /usr/local/aws-sam-cli \
+            /usr/share/swift \
+            /usr/share/rust \
+            /usr/local/julia* \
+            /usr/share/miniconda \
+            /usr/share/az_* \
+            /opt/az \
+            /opt/google \
+            /usr/local/share/chromium \
+            /usr/local/share/edge_driver \
+            /usr/local/share/gecko_driver \
+            /usr/local/share/chromedriver* \
+            /usr/local/share/powershell \
+            /usr/local/share/vcpkg \
+            /opt/pipx \
+            /opt/hostedtoolcache/CodeQL \
+            /opt/hostedtoolcache/Java* \
+            /opt/hostedtoolcache/Ruby* \
+            /opt/hostedtoolcache/go* \
+            /opt/hostedtoolcache/node* \
+            /opt/hostedtoolcache/PyPy* || true
+          sudo apt-get clean || true
           echo "Available disk space after optimization:"
           df -h /
           echo "========================================================"
@@ -379,6 +412,13 @@ jobs:
               --cache-dir "$CACHE_DIR" \
               -y
           fi
+
+      - name: 🧹 Clean Temporary Downloads Before Archiving
+        if: always() && steps.merge_step.conclusion != 'skipped'
+        run: |
+          echo "🧹 Removing raw downloads & temp files to maximize free disk space for cache/artifact..."
+          rm -rf downloads/ /tmp/tmp* /tmp/joiner_* 2>/dev/null || true
+          df -h /
 
       - name: 💾 Save Video Segments Checkpoint Cache
         if: always() && steps.merge_step.conclusion != 'skipped' && steps.merge_step.outputs.completed != 'true'

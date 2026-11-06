@@ -82,6 +82,9 @@ SUPPORTED_EXTENSIONS = {
 def natural_sort_key(s: Union[str, Path]):
     """Alphanumeric natural order key (e.g. video_2 before video_10)."""
     text = str(s.name if isinstance(s, Path) else s)
+    m_seg = re.match(r"^seg_(\d+)\.ts$", text, re.IGNORECASE)
+    if m_seg:
+        text = f"{int(m_seg.group(1)) + 1:02d} - {text}"
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r"(\d+)", text)]
 
 
@@ -242,6 +245,7 @@ class MediaFileInfo:
     audio: Optional[AudioStreamInfo] = None
     container_format: str = ""
     error: Optional[str] = None
+    display_name: str = ""
 
 
 @dataclass
@@ -635,6 +639,29 @@ def analyze_compatibility(files: List[MediaFileInfo]) -> CompatibilityAnalysis:
             elif first_a and f.audio.codec.lower() != first_a.codec.lower():
                 analysis.reasons_against_copy.append(f"File #{idx} audio codec '{f.audio.codec}' != File #1 '{first_a.codec}'")
                 can_copy = False
+
+    if not can_copy:
+        # Cap normalization resolution to 1080p (1920x1080 / 1080x1920) so mixed 4K/1080p batches
+        # don't upscale all 1080p clips to 4K and bloat runner disk space.
+        if analysis.target_width >= analysis.target_height:
+            if analysis.target_width > 1920 or analysis.target_height > 1080:
+                analysis.target_width = 1920
+                analysis.target_height = 1080
+        else:
+            if analysis.target_width > 1080 or analysis.target_height > 1920:
+                analysis.target_width = 1080
+                analysis.target_height = 1920
+
+        # Pick most common FPS (capped at 30fps) so matching 1080p clips can use ultra-fast stream copy
+        fps_counts: Dict[float, int] = {}
+        for f in valid_files:
+            if f.video and f.video.fps > 0:
+                r_fps = min(30.0, round(f.video.fps, 2))
+                fps_counts[r_fps] = fps_counts.get(r_fps, 0) + 1
+        if fps_counts:
+            analysis.target_fps = max(fps_counts.items(), key=lambda kv: kv[1])[0]
+        else:
+            analysis.target_fps = min(30.0, analysis.target_fps or 30.0)
 
     analysis.is_lossless_ready = can_copy
     return analysis
@@ -2366,18 +2393,62 @@ def download_all_videos(
     urls: List[str],
     dest_dir: Path,
     max_runtime_minutes: Optional[int] = None,
-    job_start_time: Optional[float] = None
+    job_start_time: Optional[float] = None,
+    cache_dir: Optional[Path] = None
 ) -> Tuple[List[Path], bool]:
     """Download all videos from URLs (files or folders) and convert any .ts to .mp4, with time budget checkpointing."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     downloaded = []
     failed_downloads = []
     total = len(urls)
+
+    norm_manifest = {}
+    if cache_dir and cache_dir.is_dir():
+        manifest_path = cache_dir / "normalization_manifest.json"
+        if manifest_path.is_file():
+            try:
+                norm_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                norm_manifest = {}
+        # Purge any outdated oversized (>2.2 GB) or >1080p segments from previous runs to reclaim disk space
+        ff_exe = find_binary("ffmpeg")
+        fp_exe = find_binary("ffprobe")
+        for old_seg in sorted(cache_dir.glob("seg_*.ts")):
+            try:
+                st_size = old_seg.stat().st_size
+                should_purge = st_size > 2_300_000_000
+                if not should_purge and (fp_exe or ff_exe):
+                    p_info = probe_file(old_seg, fp_exe, ff_exe)
+                    if p_info and p_info.video and (p_info.video.width > 1920 or p_info.video.height > 1920):
+                        should_purge = True
+                if should_purge:
+                    print(f"🧹 [Cache Optimizer] Removing oversized/4K legacy segment '{old_seg.name}' ({format_size(st_size)}) to free disk space...")
+                    old_seg.unlink(missing_ok=True)
+                    (cache_dir / f"{old_seg.stem}.done").unlink(missing_ok=True)
+            except Exception:
+                pass
+
     for i, u in enumerate(urls, start=1):
         # Clean URL token of any trailing commas, semicolons, quotes
         clean_u = u.strip().strip('"\'`,;<>').strip()
         if not clean_u:
             continue
+
+        # If this clip is already normalized in cache_dir, skip downloading the raw file to save time & disk space
+        if cache_dir and not is_gdrive_folder(clean_u):
+            seg_idx = i - 1
+            seg_key = f"seg_{seg_idx:04d}"
+            seg_path = cache_dir / f"{seg_key}.ts"
+            done_file = cache_dir / f"{seg_key}.done"
+            if seg_path.is_file() and seg_path.stat().st_size > 1024 and (done_file.is_file() or norm_manifest.get(seg_key, {}).get("done")):
+                print(f"⏩ [Normalized Cache Hit] Clip [{i}/{total}] already normalized ('{seg_path.name}', {format_size(seg_path.stat().st_size)}). Skipping raw download!")
+                for old_raw in dest_dir.glob(f"{i:02d} - *"):
+                    try:
+                        old_raw.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                downloaded.append(seg_path)
+                continue
 
         # Check safety time budget before starting next download
         if max_runtime_minutes and job_start_time:
@@ -2389,7 +2460,7 @@ def download_all_videos(
                 print(f"💾 Checkpoint safely preserved in cache: {len(downloaded)}/{total} files downloaded ({pct:.1f}%).")
                 print(f"🔄 Setting resumed_needed=true for GitHub Actions auto-continuation.")
                 print(f"========================================================\n")
-                final_list = [convert_ts_to_mp4(p) if is_ts_file(p) else p for p in downloaded]
+                final_list = [convert_ts_to_mp4(p) if (is_ts_file(p) and not p.name.startswith("seg_")) else p for p in downloaded]
                 return final_list, True
 
         if is_gdrive_folder(clean_u):
@@ -2422,7 +2493,7 @@ def download_all_videos(
 
     final_list = []
     for p in downloaded:
-        if is_ts_file(p):
+        if is_ts_file(p) and not p.name.startswith("seg_"):
             final_list.append(convert_ts_to_mp4(p))
         else:
             final_list.append(p)
@@ -2729,9 +2800,19 @@ class VideoJoiner:
         n = len(files)
         target_w = analysis.target_width or 1920
         target_h = analysis.target_height or 1080
-        target_fps = analysis.target_fps if analysis.target_fps > 0 else 30.0
+        if target_w >= target_h and (target_w > 1920 or target_h > 1080):
+            target_w, target_h = 1920, 1080
+        elif target_h > target_w and (target_w > 1080 or target_h > 1920):
+            target_w, target_h = 1080, 1920
+        target_fps = min(30.0, analysis.target_fps if analysis.target_fps > 0 else 30.0)
         target_sr = analysis.target_audio_sample_rate or 48000
         out_ext = output_path.suffix.lower()
+
+        # Use CABAC-enabled superfast preset and bitrate ceiling when ultrafast is passed
+        # to prevent 4x-5x file size explosion while maintaining ~5x-8x real-time encoding speed at 1080p.
+        enc_preset = "superfast" if preset == "ultrafast" else preset
+        enc_crf = max(crf, 22)
+        rate_limit_opts = ["-maxrate", "4500k", "-bufsize", "9000k"]
 
         deadline_time = (job_start_time + (max_runtime_minutes * 60.0)) if (max_runtime_minutes and job_start_time) else None
 
@@ -2741,7 +2822,7 @@ class VideoJoiner:
 
         print(f"\n🧩 Segment-by-Segment Resumable Normalization Engine")
         print(f"   Target Spec:   {target_w}x{target_h} @ {target_fps:.2f} fps, {target_sr} Hz Audio")
-        print(f"   Transcode:     libx264, preset={preset}, crf={crf}, threads=auto")
+        print(f"   Transcode:     libx264, preset={enc_preset}, crf={enc_crf}, maxrate=4500k, threads=auto")
         print(f"   Cache Folder:  {cache_dir}")
         print(f"   Total Clips:   {n}")
         if max_runtime_minutes:
@@ -2777,10 +2858,14 @@ class VideoJoiner:
             is_valid_segment = False
             partial_dur = 0.0
             if seg_path.is_file() and seg_path.stat().st_size > 1024:
-                if done_file.is_file() or (seg_key in manifest_data and manifest_data[seg_key].get("done")):
+                seg_probe = probe_file(seg_path, self.ffprobe_exe, self.ffmpeg_exe)
+                if seg_probe and seg_probe.video and (seg_probe.video.width != target_w or seg_probe.video.height != target_h):
+                    print(f"  🧹 Removing outdated cached segment '{seg_path.name}' ({seg_probe.video.width}x{seg_probe.video.height} != {target_w}x{target_h})...")
+                    seg_path.unlink(missing_ok=True)
+                    done_file.unlink(missing_ok=True)
+                elif done_file.is_file() or (seg_key in manifest_data and manifest_data[seg_key].get("done")):
                     is_valid_segment = True
                 else:
-                    seg_probe = probe_file(seg_path, self.ffprobe_exe, self.ffmpeg_exe)
                     if seg_probe and not seg_probe.error and seg_probe.video:
                         if f.duration > 0:
                             if seg_probe.duration > 0 and seg_probe.duration >= f.duration - 2.0:
@@ -2799,9 +2884,18 @@ class VideoJoiner:
 
             if is_valid_segment:
                 resumed_count += 1
+                if seg_key in manifest_data and manifest_data[seg_key].get("name"):
+                    f.display_name = manifest_data[seg_key]["name"]
                 cur_pct = ((i + 1) / n) * 100.0
-                sys.stdout.write(f"\r  [{'█'*int(30*(cur_pct/100.0)):<30}] {cur_pct:5.1f}% | ⏩ [Resume {i+1}/{n}] '{f.path.name}' already normalized. Skipping.\n")
+                label_name = f.display_name or f.path.name
+                sys.stdout.write(f"\r  [{'█'*int(30*(cur_pct/100.0)):<30}] {cur_pct:5.1f}% | ⏩ [Resume {i+1}/{n}] '{label_name}' already normalized. Skipping.\n")
                 sys.stdout.flush()
+                # Free raw download if it exists in downloads/
+                try:
+                    if f.path.is_file() and f.path.resolve() != seg_path.resolve() and "downloads" in str(f.path.resolve()).lower():
+                        f.path.unlink(missing_ok=True)
+                except Exception:
+                    pass
                 continue
 
             # Check if we can do partial resumption for an interrupted clip
@@ -2899,7 +2993,7 @@ class VideoJoiner:
                         str(target_seg_dest)
                     ]
             else:
-                # Transcode with ultrafast preset, fastdecode tune, multi-threading
+                # Transcode with CABAC-enabled preset, bitrate cap, fastdecode tune, multi-threading
                 if f.audio:
                     cmd = [
                         str(self.ffmpeg_exe), "-y",
@@ -2908,7 +3002,8 @@ class VideoJoiner:
                         "-threads", "0",
                         "-vf", clip_vf,
                         "-af", clip_af,
-                        "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
+                        "-c:v", "libx264", "-crf", str(enc_crf), "-preset", enc_preset,
+                    ] + rate_limit_opts + [
                         "-tune", "fastdecode", "-pix_fmt", "yuv420p",
                         "-c:a", "aac", "-b:a", "192k", "-ar", str(target_sr), "-ac", "2",
                         "-avoid_negative_ts", "make_zero",
@@ -2924,7 +3019,8 @@ class VideoJoiner:
                         "-f", "lavfi", "-i", f"anullsrc=r={target_sr}:cl=stereo",
                         "-threads", "0",
                         "-vf", clip_vf,
-                        "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
+                        "-c:v", "libx264", "-crf", str(enc_crf), "-preset", enc_preset,
+                    ] + rate_limit_opts + [
                         "-tune", "fastdecode", "-pix_fmt", "yuv420p",
                         "-c:a", "aac", "-b:a", "192k", "-shortest",
                         "-avoid_negative_ts", "make_zero",
@@ -2966,7 +3062,7 @@ class VideoJoiner:
 
             # If stream copy attempt failed, fall back to transcode
             if can_copy_video and (not success or not target_seg_dest.is_file() or target_seg_dest.stat().st_size < 1024) and "TIME_BUDGET_REACHED" not in err:
-                print(f"  🔄 Stream copy could not mux cleanly; switching to transcode with preset={preset}...")
+                print(f"  🔄 Stream copy could not mux cleanly; switching to transcode with preset={enc_preset}...")
                 if f.audio:
                     cmd = [
                         str(self.ffmpeg_exe), "-y",
@@ -2975,7 +3071,8 @@ class VideoJoiner:
                         "-threads", "0",
                         "-vf", clip_vf,
                         "-af", clip_af,
-                        "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
+                        "-c:v", "libx264", "-crf", str(enc_crf), "-preset", enc_preset,
+                    ] + rate_limit_opts + [
                         "-tune", "fastdecode", "-pix_fmt", "yuv420p",
                         "-c:a", "aac", "-b:a", "192k", "-ar", str(target_sr), "-ac", "2",
                         "-avoid_negative_ts", "make_zero",
@@ -2991,7 +3088,8 @@ class VideoJoiner:
                         "-f", "lavfi", "-i", f"anullsrc=r={target_sr}:cl=stereo",
                         "-threads", "0",
                         "-vf", clip_vf,
-                        "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
+                        "-c:v", "libx264", "-crf", str(enc_crf), "-preset", enc_preset,
+                    ] + rate_limit_opts + [
                         "-tune", "fastdecode", "-pix_fmt", "yuv420p",
                         "-c:a", "aac", "-b:a", "192k", "-shortest",
                         "-avoid_negative_ts", "make_zero",
@@ -3021,7 +3119,9 @@ class VideoJoiner:
                             "-map", "1:a:0",
                             "-threads", "0",
                             "-vf", clip_vf,
-                            "-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p",
+                            "-c:v", "libx264", "-crf", str(enc_crf), "-preset", enc_preset,
+                        ] + rate_limit_opts + [
+                            "-pix_fmt", "yuv420p",
                             "-c:a", "aac", "-b:a", "192k", "-shortest",
                             "-avoid_negative_ts", "make_zero",
                             "-max_muxing_queue_size", "4096",
@@ -3067,7 +3167,8 @@ class VideoJoiner:
                 done_file.touch(exist_ok=True)
                 manifest_data[seg_key] = {
                     "index": i,
-                    "name": f.path.name,
+                    "name": f.display_name or f.path.name,
+                    "resolution": f"{target_w}x{target_h}",
                     "size": seg_path.stat().st_size,
                     "done": True,
                     "timestamp": time.time()
@@ -3079,7 +3180,7 @@ class VideoJoiner:
 
             # Free up runner disk space immediately by deleting raw downloaded file if in downloads
             try:
-                if f.path.is_file() and "downloads" in str(f.path.resolve()).lower():
+                if f.path.is_file() and f.path.resolve() != seg_path.resolve() and "downloads" in str(f.path.resolve()).lower():
                     f.path.unlink(missing_ok=True)
             except Exception:
                 pass
@@ -3140,6 +3241,16 @@ class VideoJoiner:
 
             if not success or not target_part_output.is_file():
                 return False, f"Failed lossless concat of {part_label}: {err}", False, []
+
+            # Free segment cache files immediately after part concatenation to prevent doubling disk usage
+            for s_f in p_files:
+                try:
+                    s_idx = files.index(s_f)
+                    s_path = cache_dir / f"seg_{s_idx:04d}.ts"
+                    if s_path.is_file():
+                        s_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
         return True, "", False, generated_part_files
 
@@ -3256,7 +3367,8 @@ def generate_timestamps_file(probed_files: List[MediaFileInfo], output_path: Pat
     current_sec = 0.0
     chapter_rows = []
     for idx, item in enumerate(probed_files, 1):
-        clean_title = clean_chapter_title(item.path.name)
+        raw_name = getattr(item, "display_name", "") or item.path.name
+        clean_title = clean_chapter_title(raw_name)
         start_ts = format_timestamp_hms(current_sec)
         # Ensure first timestamp in chapter block begins at 00:00:00 or 00:00 for YouTube compliance
         if idx == 1:
@@ -3267,7 +3379,7 @@ def generate_timestamps_file(probed_files: List[MediaFileInfo], output_path: Pat
         chapter_rows.append({
             "index": idx,
             "title": clean_title,
-            "filename": item.path.name,
+            "filename": raw_name,
             "start": start_ts,
             "end": format_timestamp_hms(end_sec),
             "duration": format_duration(item.duration),
@@ -3365,10 +3477,10 @@ def execute_join(
     is_ci = bool(os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"))
     ffmpeg_exe, ffprobe_exe = ensure_ffmpeg(auto_prompt=not is_ci)
 
-    # Convert any input .ts videos to .mp4 before probing and merging
+    # Convert any input .ts videos to .mp4 before probing and merging (skip cached seg_XXXX.ts)
     processed_files: List[Path] = []
     for p in files:
-        if is_ts_file(p):
+        if is_ts_file(p) and not p.name.startswith("seg_"):
             processed_files.append(convert_ts_to_mp4(p, ffmpeg_exe=ffmpeg_exe, ffprobe_exe=ffprobe_exe, delete_original=True))
         else:
             processed_files.append(p)
@@ -3627,13 +3739,15 @@ def main():
             print(f"🔗 Links count:   {len(g.urls)}")
             print(f"========================================================\n")
 
+            batch_cache = (Path(args.cache_dir) / g.name) if args.cache_dir else (Path(".video_cache") / g.name)
             input_paths = []
             try:
                 input_paths, dl_resume_needed = download_all_videos(
                     g.urls,
                     dest_dir=download_dir,
                     max_runtime_minutes=args.max_runtime,
-                    job_start_time=job_start_time
+                    job_start_time=job_start_time,
+                    cache_dir=batch_cache
                 )
                 if dl_resume_needed:
                     set_github_action_output("completed", "false")
@@ -3650,7 +3764,6 @@ def main():
                 overall_success = False
                 continue
 
-            batch_cache = (Path(args.cache_dir) / g.name) if args.cache_dir else (Path(".video_cache") / g.name)
             batch_yt_title = f"{g.name}" if not youtube_title else f"{youtube_title} - {g.name}"
             success, resume_needed = execute_join(
                 files=input_paths,
@@ -3696,17 +3809,22 @@ def main():
     input_paths: List[Path] = []
     is_downloaded = False
     single_output_name = args.output
-    dl_resume_needed = False
-
     if batch_groups and len(batch_groups) == 1:
         single_g = batch_groups[0]
         if single_g.name != "merged_video" and (not args.output or args.output == "merged_video.mp4"):
             single_output_name = f"{single_g.name}.mp4"
+    output_path = Path(single_output_name)
+    single_cache = Path(args.cache_dir) if args.cache_dir else (Path(".video_cache") / output_path.stem)
+    dl_resume_needed = False
+
+    if batch_groups and len(batch_groups) == 1:
+        single_g = batch_groups[0]
         input_paths, dl_resume_needed = download_all_videos(
             single_g.urls,
             dest_dir=download_dir,
             max_runtime_minutes=args.max_runtime,
-            job_start_time=job_start_time
+            job_start_time=job_start_time,
+            cache_dir=single_cache
         )
         is_downloaded = True
     elif args.gdrive:
@@ -3715,7 +3833,8 @@ def main():
             urls,
             dest_dir=download_dir,
             max_runtime_minutes=args.max_runtime,
-            job_start_time=job_start_time
+            job_start_time=job_start_time,
+            cache_dir=single_cache
         )
         is_downloaded = True
     elif args.urls:
@@ -3726,7 +3845,8 @@ def main():
             parsed_urls,
             dest_dir=download_dir,
             max_runtime_minutes=args.max_runtime,
-            job_start_time=job_start_time
+            job_start_time=job_start_time,
+            cache_dir=single_cache
         )
         is_downloaded = True
     elif os.environ.get("GDRIVE_URLS") or os.environ.get("VIDEO_URLS"):
@@ -3736,7 +3856,8 @@ def main():
             parsed_urls,
             dest_dir=download_dir,
             max_runtime_minutes=args.max_runtime,
-            job_start_time=job_start_time
+            job_start_time=job_start_time,
+            cache_dir=single_cache
         )
         is_downloaded = True
     elif args.input:
@@ -3757,8 +3878,6 @@ def main():
         print("❌ Error: No input video files or Google Drive URLs provided.")
         sys.exit(1)
 
-    output_path = Path(single_output_name)
-    single_cache = Path(args.cache_dir) if args.cache_dir else (Path(".video_cache") / output_path.stem)
     success, resume_needed = execute_join(
         files=input_paths,
         output_path=output_path,
